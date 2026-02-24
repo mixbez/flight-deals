@@ -19,10 +19,30 @@ import requests
 CONFIG_PATH = Path(__file__).parent / "config.json"
 
 
+DEFAULTS = {
+    "origin": "BUD",
+    "days_ahead": 3,
+    "base_price_eur": 20,
+    "base_duration_minutes": 90,
+    "price_increment_eur": 10,
+    "increment_minutes": 30,
+    "currency": "eur",
+    "market": "hu",
+    "limit": 100,
+    "direct_only": False,
+    "aviasales_token": "",
+    "telegram_bot_token": "",
+    "telegram_chat_id": "",
+}
+
+
 def load_config(path: Path = CONFIG_PATH) -> dict:
-    """Load configuration from JSON file, with env-var overrides."""
-    with open(path, encoding="utf-8") as f:
-        cfg = json.load(f)
+    """Load configuration from JSON file (if exists), with env-var overrides."""
+    cfg = dict(DEFAULTS)
+
+    if path.exists():
+        with open(path, encoding="utf-8") as f:
+            cfg.update(json.load(f))
 
     # Environment variables take priority (useful for CI / GitHub Actions)
     cfg["aviasales_token"] = os.environ.get("AVIASALES_TOKEN", cfg.get("aviasales_token", ""))
