@@ -1,8 +1,14 @@
 {
-  "sent_deals": [
-    "f0f4b9d4e764",
-    "7d1a45d78ec4"
-  ],
-  "settings": {},
-  "last_update_id": 169264068
+  "users": {
+    "1847504": {
+      "name": "Admin",
+      "settings": {},
+      "sent_deals": [
+        "f0f4b9d4e764",
+        "7d1a45d78ec4"
+      ]
+    }
+  },
+  "pending": {},
+  "last_update_id": 169264069
 }
