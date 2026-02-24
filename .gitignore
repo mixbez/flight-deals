@@ -1,0 +1,9 @@
+# Secrets — don't commit tokens
+config.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/

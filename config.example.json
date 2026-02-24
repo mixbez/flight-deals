@@ -1,0 +1,15 @@
+{
+    "origin": "BUD",
+    "days_ahead": 3,
+    "base_price_eur": 20,
+    "base_duration_minutes": 90,
+    "price_increment_eur": 10,
+    "increment_minutes": 30,
+    "currency": "eur",
+    "market": "hu",
+    "limit": 100,
+    "direct_only": false,
+    "aviasales_token": "",
+    "telegram_bot_token": "",
+    "telegram_chat_id": ""
+}
