@@ -1,7 +1,7 @@
 # ✈️ Flight Deal Finder
 
 Finds cheap one-way flights from Budapest (or any city) using the Aviasales/Travelpayouts API and sends Telegram notifications.
-Provided by [Misha]([url](https://aboutmisha.com/)) 
+Provided by [Misha](https://aboutmisha.com/) 
 ## Setup
 
 ### 1. Get Aviasales API token
