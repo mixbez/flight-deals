@@ -198,13 +198,15 @@ def user_settings(state: dict, chat_id: str) -> dict:
 TG_API = "https://api.telegram.org/bot{token}"
 
 
+FOOTER = "\n\n_by aboutmisha.com_"
+
+
 def send_tg(text: str, chat_id, cfg: dict, parse_mode: str = None) -> None:
     bot_token = cfg.get("telegram_bot_token", "")
     if not bot_token or not chat_id:
         return
-    payload = {"chat_id": str(chat_id), "text": text, "disable_web_page_preview": True}
-    if parse_mode:
-        payload["parse_mode"] = parse_mode
+    text += FOOTER
+    payload = {"chat_id": str(chat_id), "text": text, "disable_web_page_preview": True, "parse_mode": "Markdown"}
     try:
         requests.post(f"{TG_API.format(token=bot_token)}/sendMessage", json=payload, timeout=15)
     except Exception as e:
