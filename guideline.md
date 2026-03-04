@@ -327,21 +327,139 @@ Keep the existing `/users` command as-is (it shows names, settings, pending list
 
 ---
 
-## Feature 6: `/days` — Search Window
+## Feature 6: `/days` — Search Window & API Optimization
 
-The current `/days N` command already exists and sets `days_ahead`. Confirm it works as follows:
+The `/days N` command sets `days_ahead` (search window in days ahead). Valid range: 1–90.
 
 - `/days 3` → search 3 days ahead (today, tomorrow, day after)
 - `/days 7` → search 7 days ahead
 - `/days 90` → search 90 days ahead
 
-This already works in the current code (`range(days_ahead)` loop in `search_for_user`). No change needed except ensuring the help text makes this clear. Update HELP_TEXT to:
+Update HELP_TEXT to:
 
 ```
-/days N — окно поиска (сколько дней вперёд, напр. 3, 7, 90)
+/days N — окно поиска (дней вперёд, 1–90)
 ```
 
-**Important note for large windows:** When `days_ahead` is large (like 90), the bot makes one API call per day per user (or two for round-trip). For 90 days round-trip, that's 180 API calls per user per hour. The Aviasales API has rate limits. Add a small delay between API calls (`await asyncio.sleep(0.3)`) to avoid hitting rate limits. Also cap `days_ahead` at a maximum of 90 with a validation message.
+### API Optimization with Month-Level Requests
+
+**Critical:** The Aviasales `prices_for_dates` API supports two `departure_at` formats:
+1. **`YYYY-MM`** — returns prices for the **entire month**
+2. **`YYYY-MM-DD`** — returns prices for a specific day
+
+**Current (suboptimal) approach:** Making 90 separate API calls for 90 days.
+
+**Optimized approach:** Batch requests by **month**. For each month that overlaps with `today .. today + days_ahead`, make **one request** with `departure_at=YYYY-MM`, parse the month's data, filter to only the relevant dates.
+
+Example: If today is 2026-03-04 and user has `/days 45`:
+- Search range: 2026-03-04 to 2026-04-18
+- API calls needed: 2 (one for 2026-03, one for 2026-04)
+- Parse both responses and extract only matching dates
+
+For one-way: **~2 API calls per user per hour** (vs 90).
+For round-trip: **~4 API calls per user per hour** (vs 180).
+
+### Implementation in `fetch_flights()` and `search_for_user()`
+
+**Old `fetch_flights(departure_date, origin, ...)`:** Takes a single date string.
+
+**New `fetch_flights(departure_month, origin, ...)`:** Takes a month string like `"2026-03"`. Returns full month data. Example:
+
+```python
+async def fetch_flights(departure_month: str, origin: str, cfg: dict, s: dict) -> list[dict]:
+    """
+    Fetch flights for an entire month (one API call).
+    departure_month: "2026-03" format
+    Returns: list of all tickets for that month
+    """
+    params = {
+        "origin": origin,
+        "departure_at": departure_month,  # YYYY-MM format
+        "one_way": "true",
+        "currency": s.get("currency", "eur"),
+        "market": s.get("market", "hu"),
+        "limit": s.get("limit", 100),
+        "sorting": "price",
+        "token": cfg["aviasales_token"],
+    }
+    if s.get("direct_only"):
+        params["direct"] = "true"
+
+    async with session.get(API_BASE, params=params, timeout=aiohttp.ClientTimeout(total=30)) as resp:
+        data = await resp.json()
+        if not data.get("success"):
+            return []
+        return data.get("data", [])
+```
+
+**New `search_for_user()` logic:**
+
+```python
+async def search_for_user(chat_id: str, state: dict, cfg: dict) -> None:
+    s = user_settings(state, chat_id)
+    user_data = state["users"][chat_id]
+    sent_hashes = set(user_data.get("sent_deals", []))
+
+    days_ahead = s.get("days_ahead", 3)
+    today = datetime.utcnow().date()
+    end_date = today + timedelta(days=days_ahead)
+
+    # Determine which months to fetch
+    months_to_fetch = set()
+    current = today
+    while current <= end_date:
+        months_to_fetch.add(current.strftime("%Y-%m"))
+        # Move to next month
+        if current.month == 12:
+            current = current.replace(year=current.year + 1, month=1, day=1)
+        else:
+            current = current.replace(month=current.month + 1, day=1)
+
+    all_new: list[dict] = []
+
+    for month_str in sorted(months_to_fetch):
+        # Fetch entire month
+        tickets = await fetch_flights(month_str, s["origin"], cfg, s)
+
+        # Filter to only dates in our range
+        for ticket in tickets:
+            dep_date_str = ticket.get("departure_at", "")
+            if not dep_date_str:
+                continue
+            dep_date = datetime.fromisoformat(dep_date_str.split("T")[0]).date()
+
+            if dep_date < today or dep_date > end_date:
+                continue  # Skip dates outside search window
+
+            deals = filter_deals([ticket], s)
+            for d in deals:
+                h = deal_hash(d)
+                if h not in sent_hashes:
+                    d["_hash"] = h
+                    all_new.append(d)
+
+    # Rest is the same: notify, deduplicate, save
+    ...
+```
+
+**For round-trip:** Make two month-level API calls (outbound and return).
+
+### Rate Limiting
+
+With month-level batching, rate limits are rarely hit. But add a small delay between month fetches as a precaution:
+
+```python
+for month_str in sorted(months_to_fetch):
+    tickets = await fetch_flights(month_str, ...)
+    await asyncio.sleep(0.2)  # Small delay between API calls
+```
+
+### Validation
+
+Validate `/days` command:
+- Min: 1 day
+- Max: 90 days
+- Invalid input: `"⚠️ /days должна быть от 1 до 90"`
 
 ---
 
@@ -450,13 +568,18 @@ Handle `/destination` specially: if arg is `"off"` or `""`, set to empty string.
 3. `.github/workflows/check-flights.yml` (no more GitHub Actions)
 4. The `getUpdates` polling call in `process_telegram_commands`
 
-### What to Keep
+### What to Keep & Modify
 
-1. `state.json` local file persistence
-2. `deal_hash()`, `max_price_for_duration()`, `user_settings()` helper functions
-3. `filter_deals()` and `format_deal()` (modify for round-trip support)
-4. `fetch_flights()` (make async, keep same API params)
-5. All user settings logic, approval flow structure
+1. `state.json` local file persistence (same structure, new keys)
+2. `deal_hash()`, `max_price_for_duration()`, `user_settings()` helper functions — unchanged
+3. `filter_deals()` and `format_deal()` — modify for round-trip support
+4. User settings logic, approval flow structure — unchanged
+5. **`fetch_flights()`** — **MAJOR REFACTOR**: change from per-day to per-month API calls
+   - Old: `fetch_flights(departure_date: str, ...)` → takes `"2026-03-04"`
+   - New: `fetch_flights(departure_month: str, ...)` → takes `"2026-03"`, returns full month
+6. **`search_for_user()`** — **REFACTOR**: batch months instead of days
+   - Old: loop `for delta in range(days_ahead)` → calls API 90 times
+   - New: collect months to fetch, loop `for month_str in sorted(...)` → calls API ~2 times
 
 ### What to Add
 
@@ -522,6 +645,8 @@ Delete `.github/` directory entirely (no more GitHub Actions).
 | Scheduling | GitHub Actions cron | `asyncio.sleep(3600)` loop |
 | HTTP library | `requests` (sync) | `aiohttp` (async) |
 | State storage | Local file + GitHub Gist | Local file only |
+| Flight API calls (90 days) | 90 per user per hour | 2 per user per hour (month batching) |
+| Round-trip API calls (90 days) | 180 per user per hour | 4 per user per hour |
 | Flight mode | One-way only | One-way + round-trip |
 | Onboarding | `/start` → immediate pending | `/start` → referral question → pending |
 | Admin tools | `/approve`, `/reject`, `/users` | + `/revoke`, `/userlist` |
