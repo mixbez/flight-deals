@@ -51,7 +51,7 @@ logger.info("Logging initialized")
 # ---------------------------------------------------------------------------
 
 CONFIG_PATH = Path(__file__).parent / "config.json"
-STATE_PATH = Path(__file__).parent / "state.json"
+STATE_PATH = Path("/app/data") / "state.json"
 
 TG_API = "https://api.telegram.org/bot{token}"
 AVIASALES_API = "https://api.travelpayouts.com/aviasales/v3/prices_for_dates"
@@ -187,6 +187,7 @@ def load_state(cfg: dict) -> dict:
 
 def save_state(state: dict, cfg: dict) -> None:
     """Save state to local file."""
+    STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
     with open(STATE_PATH, "w", encoding="utf-8") as f:
         json.dump(state, f, indent=2, ensure_ascii=False)
 
@@ -322,6 +323,7 @@ def format_deal(deal: dict, is_round_trip: bool = False) -> str:
             msg += f"    {ret_airline} {ret_flight}\n"
         if ret_url:
             msg += f"    {ret_url}\n"
+        msg += f"   by aboutmisha.com\n"
 
         return msg
     else:
@@ -347,6 +349,7 @@ def format_deal(deal: dict, is_round_trip: bool = False) -> str:
             msg += f"   {airline} {flight}\n"
         if url:
             msg += f"   {url}\n"
+        msg += f"   by aboutmisha.com\n"
 
         return msg
 
@@ -355,8 +358,12 @@ def format_deal(deal: dict, is_round_trip: bool = False) -> str:
 # Telegram API Calls
 # ---------------------------------------------------------------------------
 
-async def send_tg(text: str, chat_id: str, cfg: dict, parse_mode: str = "Markdown") -> bool:
-    """Send message via Telegram API."""
+async def send_tg(text: str, chat_id: str, cfg: dict, parse_mode: str = "Markdown", reply_markup: dict = None) -> bool:
+    """Send message via Telegram API.
+
+    reply_markup: Optional inline keyboard dict with structure:
+        {"inline_keyboard": [[{"text": "Button", "callback_data": "data"}]]}
+    """
     logger.debug(f"📤 send_tg called: chat_id={chat_id}, text_len={len(text)}, parse_mode={parse_mode}")
     text = text + FOOTER
     payload = {
@@ -365,6 +372,8 @@ async def send_tg(text: str, chat_id: str, cfg: dict, parse_mode: str = "Markdow
         "disable_web_page_preview": True,
         "parse_mode": parse_mode,
     }
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
     try:
         logger.debug(f"📲 Posting message to Telegram API for chat_id={chat_id}")
         async with session.post(
@@ -464,8 +473,11 @@ async def fetch_flights(departure_month: str, origin: str, destination: str, cfg
     return []
 
 
-async def search_for_user(chat_id: str, state: dict, cfg: dict) -> None:
-    """Search for flights for a single user."""
+async def search_for_user(chat_id: str, state: dict, cfg: dict, notify_if_empty: bool = False) -> None:
+    """Search for flights for a single user.
+
+    notify_if_empty: If True, send message when no flights found (used for /require command)
+    """
     logger.info(f"🔍 search_for_user called for {chat_id}")
     user_data = state["users"].get(str(chat_id), {})
     settings = user_settings(state, chat_id)
@@ -600,6 +612,11 @@ async def search_for_user(chat_id: str, state: dict, cfg: dict) -> None:
         # Update sent deals
         user_data["sent_deals"] = list(sent_hashes | {d[0].get("_hash") for d in all_new})
         state["users"][str(chat_id)] = user_data
+    elif notify_if_empty:
+        logger.debug(f"ℹ️ No new flights found for user {chat_id}")
+        await send_tg("ℹ️ Новых полётов не найдено.", chat_id, cfg)
+    else:
+        logger.debug(f"ℹ️ No new flights found for user {chat_id} (silent mode)")
 
 
 async def hourly_flight_check(cfg: dict, state: dict) -> None:
@@ -617,8 +634,8 @@ async def hourly_flight_check(cfg: dict, state: dict) -> None:
                 logger.error(f"  ❌ Error for {chat_id}: {e}", exc_info=True)
 
         save_state(state, cfg)
-        logger.info(f"✅ Hourly check completed, sleeping for 1 hour...")
-        await asyncio.sleep(3600)  # 1 hour
+        logger.info(f"✅ Hourly check completed, sleeping for 60 seconds...")
+        await asyncio.sleep(60)  # TEST: 60 seconds (normally 3600 for 1 hour)
 
 
 # ---------------------------------------------------------------------------
@@ -805,6 +822,49 @@ async def process_single_update(update: dict, cfg: dict, state: dict) -> None:
             )
             return
 
+        elif cmd == "/require":
+            if arg.strip().lower() == "all":
+                logger.debug(f"🔄 /require all - admin requesting flight search for ALL users")
+                await send_tg("🔄 Ищу полёты для всех пользователей...", chat_id, cfg)
+                for user_id in list(state["users"].keys()):
+                    try:
+                        logger.debug(f"  Checking user {user_id}...")
+                        await search_for_user(user_id, state, cfg, notify_if_empty=True)
+                    except Exception as e:
+                        logger.error(f"  ❌ Error for {user_id}: {e}")
+                await send_tg("✅ Поиск завершён для всех!", chat_id, cfg)
+                logger.debug(f"✅ /require all completed")
+            else:
+                logger.debug(f"🔄 /require - admin requesting flight search for themselves")
+                await send_tg("🔄 Поиск полётов...", chat_id, cfg)
+                await search_for_user(chat_id, state, cfg, notify_if_empty=True)
+                await send_tg("✅ Поиск завершён!", chat_id, cfg)
+                logger.debug(f"✅ /require completed for admin")
+            return
+
+        elif cmd == "/write":
+            if not arg.strip():
+                await send_tg("⚠️ Укажите сообщение: /write сообщение", chat_id, cfg)
+                return
+
+            message = arg.strip()
+            logger.debug(f"📢 /write - sending message to all users: {message[:50]}")
+            await send_tg(f"✅ Отправляю сообщение {len(state['users'])} пользователям...", chat_id, cfg)
+
+            sent_count = 0
+            for user_id in list(state["users"].keys()):
+                try:
+                    logger.debug(f"  Sending to {user_id}...")
+                    result = await send_tg(message, user_id, cfg)
+                    if result:
+                        sent_count += 1
+                except Exception as e:
+                    logger.error(f"  ❌ Error sending to {user_id}: {e}")
+
+            await send_tg(f"✅ Отправлено {sent_count}/{len(state['users'])} пользователям!", chat_id, cfg)
+            logger.debug(f"✅ /write completed")
+            return
+
     # User commands (approved users)
     logger.debug(f"🎮 Checking user commands for: {cmd}")
 
@@ -823,14 +883,15 @@ async def process_single_update(update: dict, cfg: dict, state: dict) -> None:
 
         text = (
             f"⚙️ *Ваши настройки:*\n\n"
-            f"✈️ Город вылета: `{s['origin']}`\n"
-            f"🔄 Тип: {trip_type}\n"
-            f"📅 Дней вперёд: {s['days_ahead']}\n"
-            f"💰 Базовая цена: {s['base_price_eur']}€\n"
-            f"⏱️ Макс. длина за базовую цену: {s['base_duration_minutes']}мин\n"
-            f"📈 Доп. €/30мин: {s['price_increment_eur']}€\n"
-            f"🎯 Только прямые: {'✅' if s['direct_only'] else '❌'}\n"
+            f"✈️ Город вылета: `{s['origin']}` `/origin`\n"
+            f"🔄 Тип: {trip_type} `/destination`\n"
+            f"📅 Дней вперёд: {s['days_ahead']} `/days`\n"
+            f"💰 Базовая цена: {s['base_price_eur']}€ `/price`\n"
+            f"⏱️ Макс. длина за базовую цену: {s['base_duration_minutes']}мин `/duration`\n"
+            f"📈 Доп. €/30мин: {s['price_increment_eur']}€ `/increment`\n"
+            f"🎯 Только прямые: {'✅' if s['direct_only'] else '❌'} `/direct`\n"
         )
+
         logger.debug(f"📨 Sending settings message to {chat_id}")
         await send_tg(text, chat_id, cfg)
         logger.debug(f"✅ /settings sent to {chat_id}")
