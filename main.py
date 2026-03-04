@@ -1,223 +1,44 @@
 """
-Flight Deal Finder — multi-user Telegram bot.
+Flight Deal Finder — webhook-based persistent Telegram bot.
 
 Features:
-  - Multi-user with admin approval (/approve, /reject, /users)
-  - Per-user settings and deal deduplication
-  - Persistent state via GitHub Gist (CI) or local file
-  - Telegram commands to change search parameters
+  - Webhook-based Telegram integration (instant command processing)
+  - Hourly background flight search (asyncio)
+  - Multi-user with admin approval workflow
+  - One-way and round-trip flight search
+  - Month-level API batching for Aviasales
+  - Referral question onboarding
+  - Admin commands: /approve, /reject, /revoke, /userlist, /users
 """
 
+import asyncio
 import hashlib
 import json
 import math
-import sys
 import os
 from datetime import datetime, timedelta
 from pathlib import Path
-
-import requests
+from aiohttp import web, ClientSession, ClientTimeout
 
 # ---------------------------------------------------------------------------
-# Config & defaults
+# Constants & Config
 # ---------------------------------------------------------------------------
 
 CONFIG_PATH = Path(__file__).parent / "config.json"
 STATE_PATH = Path(__file__).parent / "state.json"
 
-DEFAULT_USER_SETTINGS = {
-    "origin": "BUD",
-    "days_ahead": 3,
-    "base_price_eur": 20,
-    "base_duration_minutes": 90,
-    "price_increment_eur": 10,
-    "increment_minutes": 30,
-    "currency": "eur",
-    "market": "hu",
-    "limit": 100,
-    "direct_only": False,
-}
-
-
-def load_config() -> dict:
-    cfg = {
-        "aviasales_token": "",
-        "telegram_bot_token": "",
-        "admin_chat_id": "",
-        "gist_id": "",
-    }
-
-    if CONFIG_PATH.exists():
-        with open(CONFIG_PATH, encoding="utf-8") as f:
-            cfg.update(json.load(f))
-
-    # Legacy: treat telegram_chat_id as admin_chat_id
-    if not cfg.get("admin_chat_id") and cfg.get("telegram_chat_id"):
-        cfg["admin_chat_id"] = str(cfg["telegram_chat_id"])
-
-    env_map = {
-        "AVIASALES_TOKEN": "aviasales_token",
-        "TELEGRAM_BOT_TOKEN": "telegram_bot_token",
-        "TELEGRAM_CHAT_ID": "admin_chat_id",
-        "GIST_ID": "gist_id",
-    }
-    for env_key, cfg_key in env_map.items():
-        val = os.environ.get(env_key)
-        if val:
-            cfg[cfg_key] = val
-
-    cfg["admin_chat_id"] = str(cfg.get("admin_chat_id", ""))
-    return cfg
-
-
-# ---------------------------------------------------------------------------
-# State persistence
-# ---------------------------------------------------------------------------
-# State shape:
-# {
-#   "users": { "<chat_id>": { "name": "...", "settings": {...}, "sent_deals": [...] } },
-#   "pending": { "<chat_id>": { "name": "...", "username": "..." } },
-#   "last_update_id": 0
-# }
-
-
-def empty_state() -> dict:
-    return {"users": {}, "pending": {}, "last_update_id": 0}
-
-
-def load_state(cfg: dict) -> dict:
-    gist_id = cfg.get("gist_id", "")
-
-    if gist_id:
-        try:
-            resp = requests.get(f"https://api.github.com/gists/{gist_id}", timeout=10)
-            resp.raise_for_status()
-            content = resp.json()["files"]["state.json"]["content"]
-            state = json.loads(content)
-            print(f"📂 State from Gist ({len(state.get('users', {}))} user(s)).")
-            return migrate_state(state, cfg)
-        except Exception as e:
-            print(f"⚠️  Gist load error: {e}")
-
-    if STATE_PATH.exists():
-        try:
-            with open(STATE_PATH, encoding="utf-8") as f:
-                state = json.load(f)
-            print(f"📂 State from file ({len(state.get('users', {}))} user(s)).")
-            return migrate_state(state, cfg)
-        except Exception:
-            pass
-
-    return migrate_state(empty_state(), cfg)
-
-
-def migrate_state(state: dict, cfg: dict) -> dict:
-    """Migrate old single-user state to multi-user format."""
-    if "users" in state and "pending" in state:
-        # Already new format — make sure admin is in users
-        admin_id = cfg.get("admin_chat_id", "")
-        if admin_id and admin_id not in state["users"]:
-            old_settings = state.pop("settings", {})
-            old_sent = state.pop("sent_deals", [])
-            state["users"][admin_id] = {
-                "name": "Admin",
-                "settings": old_settings,
-                "sent_deals": old_sent,
-            }
-        return state
-
-    # Old format: { sent_deals, settings, last_update_id }
-    admin_id = cfg.get("admin_chat_id", "")
-    new_state = empty_state()
-    new_state["last_update_id"] = state.get("last_update_id", 0)
-    if admin_id:
-        new_state["users"][admin_id] = {
-            "name": "Admin",
-            "settings": state.get("settings", {}),
-            "sent_deals": state.get("sent_deals", []),
-        }
-    return new_state
-
-
-def save_state(state: dict, cfg: dict) -> None:
-    content = json.dumps(state, ensure_ascii=False, indent=2)
-
-    with open(STATE_PATH, "w", encoding="utf-8") as f:
-        f.write(content)
-
-    gist_id = cfg.get("gist_id", "")
-    gh_token = os.environ.get("GH_TOKEN", "")
-    if gist_id and gh_token:
-        try:
-            resp = requests.patch(
-                f"https://api.github.com/gists/{gist_id}",
-                headers={"Authorization": f"token {gh_token}"},
-                json={"files": {"state.json": {"content": content}}},
-                timeout=10,
-            )
-            resp.raise_for_status()
-            print("💾 State saved to Gist.")
-        except Exception as e:
-            print(f"⚠️  Gist save error: {e}")
-
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-
-def deal_hash(deal: dict) -> str:
-    key = f"{deal['origin']}-{deal['destination']}-{deal['departure_at']}-{deal['price']}"
-    return hashlib.md5(key.encode()).hexdigest()[:12]
-
-
-def max_price_for_duration(duration_minutes: int, s: dict) -> float:
-    base_price = s.get("base_price_eur", 20)
-    base_dur = s.get("base_duration_minutes", 90)
-    increment = s.get("price_increment_eur", 10)
-    step = s.get("increment_minutes", 30)
-
-    if duration_minutes <= base_dur:
-        return base_price
-    extra_steps = math.ceil((duration_minutes - base_dur) / step)
-    return base_price + extra_steps * increment
-
-
-def user_settings(state: dict, chat_id: str) -> dict:
-    """Return merged default + user settings."""
-    s = dict(DEFAULT_USER_SETTINGS)
-    user = state["users"].get(chat_id, {})
-    s.update(user.get("settings", {}))
-    return s
-
-
-# ---------------------------------------------------------------------------
-# Telegram
-# ---------------------------------------------------------------------------
-
 TG_API = "https://api.telegram.org/bot{token}"
+AVIASALES_API = "https://api.travelpayouts.com/v3/prices_for_dates"
 
-
-FOOTER = "\n\n_by aboutmisha.com_"
-
-
-def send_tg(text: str, chat_id, cfg: dict, parse_mode: str = None) -> None:
-    bot_token = cfg.get("telegram_bot_token", "")
-    if not bot_token or not chat_id:
-        return
-    text += FOOTER
-    payload = {"chat_id": str(chat_id), "text": text, "disable_web_page_preview": True, "parse_mode": "Markdown"}
-    try:
-        requests.post(f"{TG_API.format(token=bot_token)}/sendMessage", json=payload, timeout=15)
-    except Exception as e:
-        print(f"⚠️  TG send error: {e}")
-
+FOOTER = "\n\n_🤖 Flight Deals Bot_"
 
 HELP_TEXT = """🤖 *Команды:*
 
 /origin XXX — город вылета (IATA)
-/days N — дней вперёд
-/price N — базовая цена (€)
+/destination XXX — город назначения (IATA, для туда-обратно)
+/destination off — отключить туда-обратно (только в одну сторону)
+/days N — окно поиска (дней вперёд, 1–90)
+/price N — лимит цены за сегмент (€)
 /duration N — макс. длительность для базовой цены (мин)
 /increment N — доп. € за каждые 30 мин
 /direct — вкл/выкл только прямые
@@ -229,327 +50,831 @@ ADMIN_HELP = """
 👑 *Админ-команды:*
 /approve ID — одобрить пользователя
 /reject ID — отклонить
-/users — список пользователей"""
+/revoke ID — удалить пользователя (бан)
+/users — список пользователей
+/userlist — все ID пользователей"""
+
+DEFAULT_USER_SETTINGS = {
+    "origin": "BUD",
+    "destination": "",  # empty = one-way, IATA code = round-trip
+    "days_ahead": 3,
+    "base_price_eur": 20,
+    "base_duration_minutes": 90,
+    "price_increment_eur": 10,
+    "increment_minutes": 30,
+    "currency": "eur",
+    "market": "hu",
+    "limit": 100,
+    "direct_only": False,
+}
 
 COMMAND_MAP = {
     "/origin": ("origin", str),
+    "/destination": ("destination", str),
     "/days": ("days_ahead", int),
     "/price": ("base_price_eur", int),
     "/duration": ("base_duration_minutes", int),
     "/increment": ("price_increment_eur", int),
 }
 
+# Global session for async HTTP calls
+session: ClientSession = None
 
-def process_telegram_commands(cfg: dict, state: dict) -> None:
-    bot_token = cfg.get("telegram_bot_token", "")
-    admin_id = cfg.get("admin_chat_id", "")
-    if not bot_token:
-        return
 
-    last_id = state.get("last_update_id", 0)
+# ---------------------------------------------------------------------------
+# Config & State Management
+# ---------------------------------------------------------------------------
+
+def load_config() -> dict:
+    """Load config from file and environment variables."""
+    cfg = {
+        "aviasales_token": "",
+        "telegram_bot_token": "",
+        "admin_chat_id": "",
+        "webhook_host": "",
+        "webhook_port": 8443,
+        "webhook_path": "/webhook-flightdeals",
+    }
+
+    if CONFIG_PATH.exists():
+        with open(CONFIG_PATH, encoding="utf-8") as f:
+            cfg.update(json.load(f))
+
+    # Environment overrides
+    env_map = {
+        "AVIASALES_TOKEN": "aviasales_token",
+        "TELEGRAM_BOT_TOKEN": "telegram_bot_token",
+        "TELEGRAM_CHAT_ID": "admin_chat_id",
+        "WEBHOOK_HOST": "webhook_host",
+        "WEBHOOK_PORT": "webhook_port",
+        "WEBHOOK_PATH": "webhook_path",
+    }
+    for env_key, cfg_key in env_map.items():
+        val = os.environ.get(env_key)
+        if val:
+            if cfg_key == "webhook_port":
+                cfg[cfg_key] = int(val)
+            else:
+                cfg[cfg_key] = val
+
+    cfg["admin_chat_id"] = str(cfg.get("admin_chat_id", ""))
+    cfg["webhook_port"] = int(cfg.get("webhook_port", 8443))
+    return cfg
+
+
+def empty_state() -> dict:
+    """Return empty state structure."""
+    return {
+        "users": {},
+        "pending": {},
+        "revoked": {},
+        "last_update_id": 0,
+    }
+
+
+def load_state(cfg: dict) -> dict:
+    """Load state from local file."""
+    if STATE_PATH.exists():
+        with open(STATE_PATH, encoding="utf-8") as f:
+            state = json.load(f)
+            print(f"📂 State loaded: {len(state.get('users', {}))} user(s)")
+            return state
+    else:
+        return empty_state()
+
+
+def save_state(state: dict, cfg: dict) -> None:
+    """Save state to local file."""
+    with open(STATE_PATH, "w", encoding="utf-8") as f:
+        json.dump(state, f, indent=2, ensure_ascii=False)
+
+
+# ---------------------------------------------------------------------------
+# Helper Functions
+# ---------------------------------------------------------------------------
+
+def user_settings(state: dict, chat_id: str) -> dict:
+    """Get user settings with defaults."""
+    user = state["users"].get(str(chat_id), {})
+    settings = user.get("settings", {})
+    return {**DEFAULT_USER_SETTINGS, **settings}
+
+
+def deal_hash(deal: dict) -> str:
+    """Generate hash for deduplication."""
     try:
-        resp = requests.get(
-            f"{TG_API.format(token=bot_token)}/getUpdates",
-            params={"offset": last_id + 1, "timeout": 0},
-            timeout=10,
-        )
-        updates = resp.json().get("result", [])
+        # Check if this is a round-trip deal (has outbound and return info)
+        if "_outbound" in deal and "_return" in deal:
+            h = hashlib.md5(
+                f"{deal['_outbound']['origin']}-{deal['_outbound']['destination']}-"
+                f"{deal['_outbound']['departure_at']}-{deal['_return']['departure_at']}-"
+                f"{deal['_total_price']}"
+                .encode()
+            ).hexdigest()
+        else:
+            # One-way deal
+            dep_date = deal.get("departure_at", "").split("T")[0]
+            h = hashlib.md5(
+                f"{deal.get('origin', '')}-{deal.get('destination', '')}-"
+                f"{dep_date}-{deal.get('price', '')}"
+                .encode()
+            ).hexdigest()
+        return h
+    except Exception:
+        return hashlib.md5(str(deal).encode()).hexdigest()
+
+
+def max_price_for_duration(duration_minutes: int, settings: dict) -> int:
+    """Calculate max price based on flight duration."""
+    base = settings["base_price_eur"]
+    base_duration = settings["base_duration_minutes"]
+
+    if duration_minutes <= base_duration:
+        return base
+
+    extra_minutes = duration_minutes - base_duration
+    extra_30_min_blocks = math.ceil(extra_minutes / settings["increment_minutes"])
+    extra_cost = extra_30_min_blocks * settings["price_increment_eur"]
+    return base + extra_cost
+
+
+def filter_deals(tickets: list, settings: dict) -> list:
+    """Filter deals based on user settings."""
+    result = []
+    for ticket in tickets:
+        # Extract price and duration
+        price = ticket.get("price")
+        duration = ticket.get("duration", 0)
+
+        if price is None:
+            continue
+
+        # Check price vs max price for this duration
+        max_p = max_price_for_duration(duration, settings)
+        if price > max_p:
+            continue
+
+        # Check direct-only if enabled
+        if settings.get("direct_only") and not ticket.get("direct"):
+            continue
+
+        # Passed all filters
+        result.append(ticket)
+
+    return result
+
+
+def format_deal(deal: dict, is_round_trip: bool = False) -> str:
+    """Format a deal for display."""
+    if is_round_trip:
+        # Round-trip format
+        outbound = deal["_outbound"]
+        ret = deal["_return"]
+        total = deal["_total_price"]
+
+        origin = outbound.get("origin", "?")
+        dest = outbound.get("destination", "?")
+
+        msg = f"✈️ {origin} ↔ {dest} — {total} EUR total\n\n"
+
+        # Outbound leg
+        out_date = outbound.get("departure_at", "").split("T")[0]
+        out_time = outbound.get("departure_at", "").split("T")[1][:5] if "T" in outbound.get("departure_at", "") else ""
+        out_duration = outbound.get("duration", 0)
+        out_hours = out_duration // 60
+        out_mins = out_duration % 60
+        out_duration_str = f"{out_hours}h{out_mins:02d}m"
+        out_airline = outbound.get("airline", "")
+        out_flight = outbound.get("flight_number", "")
+        out_price = outbound.get("price", "?")
+        out_direct = "direct" if outbound.get("direct") else "1+ stops"
+        out_url = outbound.get("search_url", "")
+
+        msg += f"  → {origin} → {dest}\n"
+        msg += f"    {out_date} {out_time} | {out_duration_str} | {out_direct}\n"
+        msg += f"    💰 {out_price} EUR\n"
+        if out_airline and out_flight:
+            msg += f"    {out_airline} {out_flight}\n"
+        if out_url:
+            msg += f"    {out_url}\n"
+
+        msg += "\n"
+
+        # Return leg
+        ret_date = ret.get("departure_at", "").split("T")[0]
+        ret_time = ret.get("departure_at", "").split("T")[1][:5] if "T" in ret.get("departure_at", "") else ""
+        ret_duration = ret.get("duration", 0)
+        ret_hours = ret_duration // 60
+        ret_mins = ret_duration % 60
+        ret_duration_str = f"{ret_hours}h{ret_mins:02d}m"
+        ret_airline = ret.get("airline", "")
+        ret_flight = ret.get("flight_number", "")
+        ret_price = ret.get("price", "?")
+        ret_direct = "direct" if ret.get("direct") else "1+ stops"
+        ret_url = ret.get("search_url", "")
+
+        msg += f"  ← {dest} → {origin}\n"
+        msg += f"    {ret_date} {ret_time} | {ret_duration_str} | {ret_direct}\n"
+        msg += f"    💰 {ret_price} EUR\n"
+        if ret_airline and ret_flight:
+            msg += f"    {ret_airline} {ret_flight}\n"
+        if ret_url:
+            msg += f"    {ret_url}\n"
+
+        return msg
+    else:
+        # One-way format
+        origin = deal.get("origin", "?")
+        dest = deal.get("destination", "?")
+        date_str = deal.get("departure_at", "").split("T")[0]
+        time_str = deal.get("departure_at", "").split("T")[1][:5] if "T" in deal.get("departure_at", "") else ""
+        price = deal.get("price", "?")
+        duration = deal.get("duration", 0)
+        hours = duration // 60
+        mins = duration % 60
+        duration_str = f"{hours}h{mins:02d}m"
+        direct = "direct" if deal.get("direct") else "1+ stops"
+        airline = deal.get("airline", "")
+        flight = deal.get("flight_number", "")
+        url = deal.get("search_url", "")
+
+        msg = f"✈️ {origin} → {dest} — {price} EUR\n"
+        msg += f"   {date_str} {time_str} | {duration_str} | {direct}\n"
+        msg += f"   💰 {price} EUR\n"
+        if airline and flight:
+            msg += f"   {airline} {flight}\n"
+        if url:
+            msg += f"   {url}\n"
+
+        return msg
+
+
+# ---------------------------------------------------------------------------
+# Telegram API Calls
+# ---------------------------------------------------------------------------
+
+async def send_tg(text: str, chat_id: str, cfg: dict, parse_mode: str = "Markdown") -> bool:
+    """Send message via Telegram API."""
+    text = text + FOOTER
+    payload = {
+        "chat_id": str(chat_id),
+        "text": text,
+        "disable_web_page_preview": True,
+        "parse_mode": parse_mode,
+    }
+    try:
+        async with session.post(
+            f"{TG_API.format(token=cfg['telegram_bot_token'])}/sendMessage",
+            json=payload,
+            timeout=ClientTimeout(total=15)
+        ) as resp:
+            if resp.status == 200:
+                return True
     except Exception as e:
-        print(f"⚠️  TG getUpdates error: {e}")
+        print(f"❌ send_tg error: {e}")
+    return False
+
+
+async def set_webhook(cfg: dict) -> None:
+    """Register webhook with Telegram."""
+    if not cfg.get("webhook_host"):
+        print("⚠️ webhook_host not set, skipping webhook registration")
         return
 
-    for upd in updates:
-        state["last_update_id"] = upd["update_id"]
-        msg = upd.get("message", {})
-        chat_id = str(msg.get("chat", {}).get("id", ""))
-        if not chat_id:
-            continue
+    url = f"{cfg['webhook_host']}:{cfg['webhook_port']}{cfg['webhook_path']}"
+    payload = {"url": url}
 
-        text = (msg.get("text") or "").strip()
-        if not text.startswith("/"):
-            continue
-
-        parts = text.split(maxsplit=1)
-        cmd = parts[0].lower().split("@")[0]
-        arg = parts[1].strip() if len(parts) > 1 else ""
-
-        from_user = msg.get("from", {})
-        display_name = from_user.get("first_name", "?")
-        username = from_user.get("username", "")
-
-        is_admin = chat_id == admin_id
-        is_approved = chat_id in state["users"]
-
-        # --- /start: registration flow ---
-        if cmd == "/start":
-            if is_approved:
-                help_msg = HELP_TEXT
-                if is_admin:
-                    help_msg += ADMIN_HELP
-                send_tg(help_msg, chat_id, cfg, parse_mode="Markdown")
-            elif chat_id in state.get("pending", {}):
-                send_tg("⏳ Ваш запрос уже отправлен. Ожидайте одобрения.", chat_id, cfg)
+    try:
+        async with session.post(
+            f"{TG_API.format(token=cfg['telegram_bot_token'])}/setWebhook",
+            json=payload,
+            timeout=ClientTimeout(total=15)
+        ) as resp:
+            if resp.status == 200:
+                print(f"✅ Webhook set: {url}")
             else:
-                state.setdefault("pending", {})[chat_id] = {
-                    "name": display_name,
-                    "username": username,
-                }
-                send_tg("📨 Запрос отправлен! Ожидайте одобрения администратором.", chat_id, cfg)
-                uname = f" (@{username})" if username else ""
-                send_tg(
-                    f"🆕 Новый запрос от *{display_name}*{uname}\nID: `{chat_id}`\n\n"
-                    f"Одобрить: `/approve {chat_id}`\nОтклонить: `/reject {chat_id}`",
-                    admin_id, cfg, parse_mode="Markdown",
-                )
-            continue
-
-        # --- Commands only for approved users ---
-        if not is_approved:
-            send_tg("⛔ Вы не авторизованы. Отправьте /start для запроса доступа.", chat_id, cfg)
-            continue
-
-        # --- /help ---
-        if cmd == "/help":
-            help_msg = HELP_TEXT
-            if is_admin:
-                help_msg += ADMIN_HELP
-            send_tg(help_msg, chat_id, cfg, parse_mode="Markdown")
-
-        # --- /settings ---
-        elif cmd == "/settings":
-            s = user_settings(state, chat_id)
-            lines = [
-                f"🏙 Откуда: `{s['origin']}`",
-                f"📅 Дней вперёд: `{s['days_ahead']}`",
-                f"💰 Базовая цена: `{s['base_price_eur']}€`",
-                f"⏱ Длительность: `{s['base_duration_minutes']} мин`",
-                f"📈 Шаг: `+{s['price_increment_eur']}€ / {s['increment_minutes']} мин`",
-                f"✈️ Только прямые: `{'да' if s.get('direct_only') else 'нет'}`",
-                f"📊 Отправлено: `{len(state['users'][chat_id].get('sent_deals', []))}`",
-            ]
-            send_tg("\n".join(lines), chat_id, cfg, parse_mode="Markdown")
-
-        # --- /direct toggle ---
-        elif cmd == "/direct":
-            settings = state["users"][chat_id].setdefault("settings", {})
-            current = settings.get("direct_only", DEFAULT_USER_SETTINGS["direct_only"])
-            settings["direct_only"] = not current
-            status = "✅ Только прямые" if settings["direct_only"] else "❌ Все рейсы"
-            send_tg(status, chat_id, cfg)
-
-        # --- /reset ---
-        elif cmd == "/reset":
-            state["users"][chat_id]["sent_deals"] = []
-            send_tg("🗑 История очищена.", chat_id, cfg)
-
-        # --- setting commands ---
-        elif cmd in COMMAND_MAP:
-            key, typ = COMMAND_MAP[cmd]
-            if not arg:
-                send_tg(f"⚠️ `{cmd} <значение>`", chat_id, cfg, parse_mode="Markdown")
-            else:
-                try:
-                    val = typ(arg.upper()) if typ == str else typ(arg)
-                    state["users"][chat_id].setdefault("settings", {})[key] = val
-                    send_tg(f"✅ `{key}` = `{val}`", chat_id, cfg, parse_mode="Markdown")
-                except ValueError:
-                    send_tg(f"⚠️ Неверное значение: {arg}", chat_id, cfg)
-
-        # --- Admin commands ---
-        elif cmd == "/approve" and is_admin:
-            if not arg:
-                send_tg("⚠️ `/approve <chat_id>`", chat_id, cfg, parse_mode="Markdown")
-            elif arg in state.get("pending", {}):
-                info = state["pending"].pop(arg)
-                state["users"][arg] = {
-                    "name": info.get("name", "?"),
-                    "settings": {},
-                    "sent_deals": [],
-                }
-                send_tg(f"✅ Пользователь {info.get('name', arg)} одобрен.", chat_id, cfg)
-                send_tg("🎉 Вы одобрены! Отправьте /help для списка команд.", arg, cfg)
-            else:
-                send_tg(f"❓ ID `{arg}` не найден в ожидающих.", chat_id, cfg, parse_mode="Markdown")
-
-        elif cmd == "/reject" and is_admin:
-            if not arg:
-                send_tg("⚠️ `/reject <chat_id>`", chat_id, cfg, parse_mode="Markdown")
-            elif arg in state.get("pending", {}):
-                info = state["pending"].pop(arg)
-                send_tg(f"❌ Запрос от {info.get('name', arg)} отклонён.", chat_id, cfg)
-                send_tg("❌ Ваш запрос отклонён администратором.", arg, cfg)
-            else:
-                send_tg(f"❓ ID `{arg}` не найден в ожидающих.", chat_id, cfg, parse_mode="Markdown")
-
-        elif cmd == "/users" and is_admin:
-            lines = ["👥 *Пользователи:*"]
-            for uid, u in state["users"].items():
-                s = dict(DEFAULT_USER_SETTINGS)
-                s.update(u.get("settings", {}))
-                admin_tag = " 👑" if uid == admin_id else ""
-                lines.append(f"• {u.get('name', '?')}{admin_tag} — `{s['origin']}`, {s['days_ahead']}д, {s['base_price_eur']}€")
-            pending = state.get("pending", {})
-            if pending:
-                lines.append(f"\n⏳ *Ожидают ({len(pending)}):*")
-                for pid, p in pending.items():
-                    lines.append(f"• {p.get('name', '?')} — `/approve {pid}`")
-            send_tg("\n".join(lines), chat_id, cfg, parse_mode="Markdown")
-
-        else:
-            send_tg("❓ Неизвестная команда. /help", chat_id, cfg)
-
-    if updates:
-        print(f"📨 Processed {len(updates)} message(s).")
+                print(f"❌ Webhook setup failed: {resp.status}")
+    except Exception as e:
+        print(f"❌ set_webhook error: {e}")
 
 
 # ---------------------------------------------------------------------------
-# Aviasales API
+# Flight API
 # ---------------------------------------------------------------------------
 
-API_BASE = "https://api.travelpayouts.com/aviasales/v3/prices_for_dates"
+async def fetch_flights(departure_month: str, origin: str, destination: str, cfg: dict, settings: dict) -> list:
+    """
+    Fetch flights for an entire month.
 
-
-def fetch_flights(departure_date: str, origin: str, cfg: dict, s: dict) -> list[dict]:
+    departure_month: "2026-03" format
+    Returns: list of all tickets for that month
+    """
     params = {
         "origin": origin,
-        "departure_at": departure_date,
+        "destination": destination,
+        "departure_at": departure_month,
         "one_way": "true",
-        "currency": s.get("currency", "eur"),
-        "market": s.get("market", "hu"),
-        "limit": s.get("limit", 100),
+        "currency": settings.get("currency", "eur"),
+        "market": settings.get("market", "hu"),
+        "limit": settings.get("limit", 100),
         "sorting": "price",
         "token": cfg["aviasales_token"],
     }
-    if s.get("direct_only"):
+
+    if settings.get("direct_only"):
         params["direct"] = "true"
 
-    resp = requests.get(API_BASE, params=params, timeout=30)
-    resp.raise_for_status()
-    data = resp.json()
-    if not data.get("success"):
-        return []
-    return data.get("data", [])
+    try:
+        async with session.get(
+            AVIASALES_API,
+            params=params,
+            timeout=ClientTimeout(total=30)
+        ) as resp:
+            if resp.status == 200:
+                data = await resp.json()
+                if data.get("success"):
+                    return data.get("data", [])
+    except Exception as e:
+        print(f"❌ fetch_flights error: {e}")
+
+    return []
 
 
-def filter_deals(tickets: list[dict], s: dict) -> list[dict]:
-    deals = []
-    for t in tickets:
-        duration = t.get("duration_to") or t.get("duration", 0)
-        if duration <= 0:
-            continue
-        price = t.get("price", 0)
-        threshold = max_price_for_duration(duration, s)
-        if price <= threshold:
-            deals.append({
-                "origin": t.get("origin", s.get("origin", "?")),
-                "destination": t.get("destination", "???"),
-                "departure_at": t.get("departure_at", ""),
-                "price": price,
-                "currency": s.get("currency", "eur").upper(),
-                "duration_min": duration,
-                "threshold": threshold,
-                "airline": t.get("airline", ""),
-                "flight_number": t.get("flight_number", ""),
-                "transfers": t.get("transfers", 0),
-                "link": t.get("link", ""),
-            })
-    return deals
+async def search_for_user(chat_id: str, state: dict, cfg: dict) -> None:
+    """Search for flights for a single user."""
+    user_data = state["users"].get(str(chat_id), {})
+    settings = user_settings(state, chat_id)
+    sent_hashes = set(user_data.get("sent_deals", []))
+
+    origin = settings["origin"]
+    destination = settings.get("destination", "").strip().upper()
+    days_ahead = max(1, min(settings.get("days_ahead", 3), 90))
+
+    today = datetime.utcnow().date()
+    end_date = today + timedelta(days=days_ahead)
+
+    # Determine which months to fetch
+    months_to_fetch = set()
+    current = today
+    while current <= end_date:
+        months_to_fetch.add(current.strftime("%Y-%m"))
+        # Move to next month
+        if current.month == 12:
+            current = current.replace(year=current.year + 1, month=1, day=1)
+        else:
+            current = current.replace(month=current.month + 1, day=1)
+
+    all_new = []
+
+    if not destination:
+        # One-way mode
+        for month_str in sorted(months_to_fetch):
+            tickets = await fetch_flights(month_str, origin, "", cfg, settings)
+
+            # Filter to only dates in our range
+            for ticket in tickets:
+                dep_date_str = ticket.get("departure_at", "")
+                if not dep_date_str:
+                    continue
+
+                try:
+                    dep_date = datetime.fromisoformat(dep_date_str.split("T")[0]).date()
+                except Exception:
+                    continue
+
+                if dep_date < today or dep_date > end_date:
+                    continue
+
+                deals = filter_deals([ticket], settings)
+                for d in deals:
+                    h = deal_hash(d)
+                    if h not in sent_hashes:
+                        d["_hash"] = h
+                        all_new.append((d, False))  # (deal, is_round_trip)
+
+            await asyncio.sleep(0.2)  # Rate limit
+    else:
+        # Round-trip mode
+        for month_str in sorted(months_to_fetch):
+            # Outbound
+            outbound_tickets = await fetch_flights(month_str, origin, destination, cfg, settings)
+            # Return
+            return_tickets = await fetch_flights(month_str, destination, origin, cfg, settings)
+
+            # Build combinations for each day
+            outbound_by_date = {}
+            for ticket in outbound_tickets:
+                dep_date_str = ticket.get("departure_at", "").split("T")[0]
+                if not dep_date_str:
+                    continue
+                try:
+                    dep_date = datetime.fromisoformat(dep_date_str).date()
+                except Exception:
+                    continue
+
+                if dep_date < today or dep_date > end_date:
+                    continue
+
+                deals = filter_deals([ticket], settings)
+                if deals:
+                    if dep_date not in outbound_by_date:
+                        outbound_by_date[dep_date] = []
+                    outbound_by_date[dep_date].extend(deals)
+
+            return_by_date = {}
+            for ticket in return_tickets:
+                dep_date_str = ticket.get("departure_at", "").split("T")[0]
+                if not dep_date_str:
+                    continue
+                try:
+                    dep_date = datetime.fromisoformat(dep_date_str).date()
+                except Exception:
+                    continue
+
+                if dep_date < today or dep_date > end_date:
+                    continue
+
+                deals = filter_deals([ticket], settings)
+                if deals:
+                    if dep_date not in return_by_date:
+                        return_by_date[dep_date] = []
+                    return_by_date[dep_date].extend(deals)
+
+            # Combine outbound and return
+            limit_per_segment = settings["base_price_eur"]
+            for out_date in outbound_by_date:
+                for ret_date in return_by_date:
+                    for out_deal in outbound_by_date[out_date]:
+                        for ret_deal in return_by_date[ret_date]:
+                            total_price = out_deal.get("price", 0) + ret_deal.get("price", 0)
+                            if total_price <= 2 * limit_per_segment:
+                                combo = {
+                                    "_outbound": out_deal,
+                                    "_return": ret_deal,
+                                    "_total_price": total_price,
+                                }
+                                h = deal_hash(combo)
+                                if h not in sent_hashes:
+                                    combo["_hash"] = h
+                                    all_new.append((combo, True))  # (deal, is_round_trip)
+
+            await asyncio.sleep(0.2)  # Rate limit
+
+    # Send new deals
+    if all_new:
+        # Sort by price
+        all_new.sort(key=lambda x: x[0].get("_total_price" if x[1] else "price", 999999))
+
+        text = f"🎉 Found {len(all_new)} new deal(s)!\n\n"
+        for deal, is_round_trip in all_new:
+            text += format_deal(deal, is_round_trip) + "\n"
+
+        await send_tg(text, chat_id, cfg)
+
+        # Update sent deals
+        user_data["sent_deals"] = sent_hashes | {d[0].get("_hash") for d in all_new}
+        state["users"][str(chat_id)] = user_data
 
 
-def format_deal(d: dict) -> str:
-    dur_h = d["duration_min"] // 60
-    dur_m = d["duration_min"] % 60
-    dep = d["departure_at"][:16].replace("T", " ") if d["departure_at"] else "?"
-    stops = "direct" if d["transfers"] == 0 else f"{d['transfers']} stop(s)"
-    link = ""
-    if d.get("link"):
-        link = f"\nhttps://www.aviasales.com{d['link']}"
-    return (
-        f"✈️ {d['origin']} → {d['destination']}\n"
-        f"   {dep} | {dur_h}h{dur_m:02d}m | {stops}\n"
-        f"   💰 {d['price']} {d['currency']} (limit {d['threshold']:.0f} {d['currency']})\n"
-        f"   {d['airline']} {d['flight_number']}{link}"
+async def hourly_flight_check(cfg: dict, state: dict) -> None:
+    """Background task: check flights for all users every hour."""
+    while True:
+        print(f"🔍 Hourly check for {len(state['users'])} user(s)…")
+        for chat_id in list(state["users"].keys()):
+            try:
+                await search_for_user(chat_id, state, cfg)
+            except Exception as e:
+                print(f"  ❌ Error for {chat_id}: {e}")
+
+        save_state(state, cfg)
+        await asyncio.sleep(3600)  # 1 hour
+
+
+# ---------------------------------------------------------------------------
+# Telegram Commands
+# ---------------------------------------------------------------------------
+
+async def process_single_update(update: dict, cfg: dict, state: dict) -> None:
+    """Process a single Telegram update."""
+    # Extract message and user info
+    message = update.get("message")
+    if not message:
+        return
+
+    chat_id = str(message.get("chat", {}).get("id", ""))
+    user = message.get("from", {})
+    user_id = str(user.get("id", ""))
+    username = user.get("username", "")
+    first_name = user.get("first_name", "")
+
+    text = (message.get("text", "") or "").strip()
+
+    if not text:
+        return
+
+    # Parse command
+    cmd_parts = text.split(None, 1)
+    cmd = cmd_parts[0].lower()
+    arg = cmd_parts[1] if len(cmd_parts) > 1 else ""
+
+    admin_id = cfg.get("admin_chat_id", "")
+    is_admin = str(chat_id) == admin_id
+
+    # Check if user is revoked
+    if str(chat_id) in state["revoked"]:
+        if cmd == "/start":
+            await send_tg("⛔ Ваш доступ был отозван.", chat_id, cfg)
+        return
+
+    # Check if user is approved
+    is_approved = str(chat_id) in state["users"]
+
+    # Pending users
+    if not is_approved and str(chat_id) in state["pending"]:
+        pending_user = state["pending"][str(chat_id)]
+
+        if pending_user.get("state") == "awaiting_referral":
+            # Non-command message = referral answer
+            if not text.startswith("/"):
+                pending_user["referral_answer"] = text
+                pending_user["state"] = "awaiting_approval"
+                state["pending"][str(chat_id)] = pending_user
+
+                await send_tg(
+                    "📨 Спасибо! Запрос отправлен. Ожидайте одобрения.",
+                    chat_id, cfg
+                )
+
+                # Notify admin
+                admin_msg = (
+                    f"🆕 Новый запрос от *{first_name}* (@{username})\n"
+                    f"ID: `{chat_id}`\n"
+                    f"Откуда узнал: «{text}»\n\n"
+                    f"/approve {chat_id} или /reject {chat_id}"
+                )
+                await send_tg(admin_msg, admin_id, cfg)
+                return
+            elif cmd in ["/start", "/help"]:
+                await send_tg(
+                    "Пожалуйста, ответьте на вопрос выше.",
+                    chat_id, cfg
+                )
+                return
+
+        elif pending_user.get("state") == "awaiting_approval":
+            if cmd == "/start":
+                await send_tg(
+                    "Запрос отправлен, ожидайте.",
+                    chat_id, cfg
+                )
+            return
+
+    # New user
+    if not is_approved and cmd == "/start":
+        state["pending"][str(chat_id)] = {
+            "name": first_name,
+            "username": username,
+            "state": "awaiting_referral",
+        }
+        await send_tg(
+            "Откуда вы узнали про бота? Поделитесь, пожалуйста 🙏",
+            chat_id, cfg
+        )
+        return
+
+    # Only approved users and admins beyond this point
+    if not is_approved and not is_admin:
+        await send_tg(
+            "⛔ У вас нет доступа.",
+            chat_id, cfg
+        )
+        return
+
+    # Admin commands
+    if is_admin:
+        if cmd == "/approve":
+            target_id = arg.strip()
+            if target_id in state["pending"]:
+                pending = state["pending"].pop(target_id)
+                state["users"][target_id] = {
+                    "name": pending.get("name", ""),
+                    "username": pending.get("username", ""),
+                    "referral_answer": pending.get("referral_answer", ""),
+                    "settings": DEFAULT_USER_SETTINGS.copy(),
+                    "sent_deals": [],
+                }
+                await send_tg(f"✅ Пользователь {pending['name']} одобрен.", chat_id, cfg)
+                await send_tg("✅ Вас одобрили! /help для справки.", target_id, cfg)
+            return
+
+        elif cmd == "/reject":
+            target_id = arg.strip()
+            if target_id in state["pending"]:
+                pending = state["pending"].pop(target_id)
+                await send_tg(f"❌ Пользователь {pending['name']} отклонен.", chat_id, cfg)
+                await send_tg("❌ В доступе отказано.", target_id, cfg)
+            return
+
+        elif cmd == "/revoke":
+            target_id = arg.strip()
+            if target_id in state["users"]:
+                user_info = state["users"].pop(target_id)
+                state["revoked"][target_id] = {
+                    "name": user_info.get("name", ""),
+                    "username": user_info.get("username", ""),
+                }
+                await send_tg(f"✅ Пользователь {user_info['name']} удалён.", chat_id, cfg)
+                await send_tg("⛔ Ваш доступ отозван администратором.", target_id, cfg)
+            return
+
+        elif cmd == "/users":
+            if not state["users"]:
+                await send_tg("Пользователей нет.", chat_id, cfg)
+                return
+
+            text = "👥 *Пользователи:*\n\n"
+            for uid, udata in sorted(state["users"].items()):
+                s = user_settings(state, uid)
+                dest = s.get("destination", "")
+                trip_type = f"туда-обратно ({dest})" if dest else "в одну сторону"
+                text += (
+                    f"*{udata['name']}* (@{udata.get('username', 'N/A')})\n"
+                    f"  ID: `{uid}`\n"
+                    f"  🔄 Тип: {trip_type}\n"
+                    f"  ✈️ {s['origin']} → ? | Цена: {s['base_price_eur']}€\n"
+                    f"  📅 Дней: {s['days_ahead']} | Сделок: {len(udata.get('sent_deals', []))}\n\n"
+                )
+
+            if state["pending"]:
+                text += "⏳ *Ожидают одобрения:*\n\n"
+                for uid, pdata in sorted(state["pending"].items()):
+                    text += f"  {pdata['name']} (@{pdata.get('username', 'N/A')}) — `{uid}`\n"
+
+            await send_tg(text, chat_id, cfg)
+            return
+
+        elif cmd == "/userlist":
+            if not state["users"]:
+                await send_tg("Пользователей нет.", chat_id, cfg)
+                return
+
+            user_ids = "\n".join(sorted(state["users"].keys()))
+            await send_tg(
+                f"📋 Все ID пользователей:\n\n{user_ids}\n\nВсего: {len(state['users'])}",
+                chat_id, cfg
+            )
+            return
+
+    # User commands (approved users)
+    if cmd == "/start" or cmd == "/help":
+        await send_tg(HELP_TEXT, chat_id, cfg)
+        return
+
+    if cmd == "/settings":
+        s = user_settings(state, chat_id)
+        dest = s.get("destination", "")
+        trip_type = f"туда-обратно ({dest})" if dest else "в одну сторону"
+
+        text = (
+            f"⚙️ *Ваши настройки:*\n\n"
+            f"✈️ Город вылета: `{s['origin']}`\n"
+            f"🔄 Тип: {trip_type}\n"
+            f"📅 Дней вперёд: {s['days_ahead']}\n"
+            f"💰 Базовая цена: {s['base_price_eur']}€\n"
+            f"⏱️ Макс. длина за базовую цену: {s['base_duration_minutes']}мин\n"
+            f"📈 Доп. €/30мин: {s['price_increment_eur']}€\n"
+            f"🎯 Только прямые: {'✅' if s['direct_only'] else '❌'}\n"
+        )
+        await send_tg(text, chat_id, cfg)
+        return
+
+    if cmd == "/reset":
+        state["users"][str(chat_id)]["sent_deals"] = []
+        await send_tg("✅ История отправленных сделок очищена.", chat_id, cfg)
+        return
+
+    if cmd == "/direct":
+        settings = user_settings(state, chat_id)
+        settings["direct_only"] = not settings.get("direct_only", False)
+        state["users"][str(chat_id)]["settings"] = settings
+        status = "✅ включены" if settings["direct_only"] else "❌ отключены"
+        await send_tg(f"Только прямые рейсы: {status}", chat_id, cfg)
+        return
+
+    # Settings commands
+    if cmd in COMMAND_MAP:
+        key, vtype = COMMAND_MAP[cmd]
+
+        if not arg:
+            await send_tg(f"⚠️ Укажите значение: {cmd} <значение>", chat_id, cfg)
+            return
+
+        try:
+            if key == "destination":
+                # Special handling for destination
+                if arg.lower() == "off" or arg == "":
+                    val = ""
+                else:
+                    val = arg.upper()
+                    if len(val) != 3:
+                        await send_tg("⚠️ Код назначения должен быть 3 буквы (IATA)", chat_id, cfg)
+                        return
+
+            elif key == "days_ahead":
+                val = int(arg)
+                if val < 1 or val > 90:
+                    await send_tg("⚠️ /days должна быть от 1 до 90", chat_id, cfg)
+                    return
+
+            else:
+                val = vtype(arg)
+
+            settings = user_settings(state, chat_id)
+            settings[key] = val
+            state["users"][str(chat_id)]["settings"] = settings
+
+            if key == "destination":
+                if val:
+                    await send_tg(f"✅ Город назначения: {val} (туда-обратно)", chat_id, cfg)
+                else:
+                    await send_tg(f"✅ Туда-обратно отключено (только в одну сторону)", chat_id, cfg)
+            else:
+                await send_tg(f"✅ {cmd} установлена на {val}", chat_id, cfg)
+
+        except ValueError:
+            await send_tg(f"⚠️ Неверное значение для {cmd}", chat_id, cfg)
+
+        return
+
+    # Unknown command
+    await send_tg(
+        "❓ Неизвестная команда. /help для справки.",
+        chat_id, cfg
     )
 
 
 # ---------------------------------------------------------------------------
-# Search per user
+# Webhook Handler
 # ---------------------------------------------------------------------------
 
+async def handle_webhook(request):
+    """Handle incoming Telegram webhook updates."""
+    try:
+        data = await request.json()
+        # We need to pass state and cfg somehow
+        # Store them in app context
+        state = request.app["state"]
+        cfg = request.app["cfg"]
 
-def search_for_user(chat_id: str, state: dict, cfg: dict) -> None:
-    s = user_settings(state, chat_id)
-    user_data = state["users"][chat_id]
-    sent_hashes = set(user_data.get("sent_deals", []))
+        await process_single_update(data, cfg, state)
+    except Exception as e:
+        print(f"❌ Webhook handler error: {e}")
 
-    days_ahead = s.get("days_ahead", 3)
-    today = datetime.utcnow().date()
-    all_new: list[dict] = []
-
-    for delta in range(days_ahead):
-        day = today + timedelta(days=delta)
-        tickets = fetch_flights(day.isoformat(), s["origin"], cfg, s)
-        deals = filter_deals(tickets, s)
-
-        for d in deals:
-            h = deal_hash(d)
-            if h not in sent_hashes:
-                d["_hash"] = h
-                all_new.append(d)
-
-    name = user_data.get("name", chat_id)
-    print(f"  👤 {name}: {len(all_new)} new deal(s)")
-
-    if all_new:
-        all_new.sort(key=lambda d: d["price"])
-
-        header = f"🔥 {len(all_new)} new cheap flight(s)!\n\n"
-        body = "\n\n".join(format_deal(d) for d in all_new)
-        text = header + body
-        if len(text) > 4096:
-            text = text[:4090] + "\n…"
-
-        send_tg(text, chat_id, cfg)
-
-        sent_list = user_data.get("sent_deals", [])
-        for d in all_new:
-            sent_list.append(d["_hash"])
-        user_data["sent_deals"] = sent_list[-500:]
+    return web.Response(text="ok")
 
 
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
+async def main():
+    """Main entry point."""
+    global session
 
-def main():
     cfg = load_config()
-
-    if not cfg.get("aviasales_token"):
-        print("❌ aviasales_token not set.")
-        sys.exit(1)
-
     state = load_state(cfg)
 
-    # Ensure admin is in users
-    admin_id = cfg.get("admin_chat_id", "")
-    if admin_id and admin_id not in state["users"]:
-        state["users"][admin_id] = {"name": "Admin", "settings": {}, "sent_deals": []}
+    # Create HTTP session
+    session = ClientSession()
 
-    # Process Telegram commands
-    process_telegram_commands(cfg, state)
+    # Set webhook
+    await set_webhook(cfg)
 
-    # Search for each user
-    print(f"\n🔍 Searching for {len(state['users'])} user(s)…")
-    for chat_id in state["users"]:
-        try:
-            search_for_user(chat_id, state, cfg)
-        except Exception as e:
-            print(f"  ❌ Error for {chat_id}: {e}")
+    # Create web app
+    app = web.Application()
+    app["state"] = state
+    app["cfg"] = cfg
+    app.router.add_post(cfg["webhook_path"], handle_webhook)
 
-    save_state(state, cfg)
-    print("✅ Done.")
+    # Start web server
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", cfg["webhook_port"])
+    await site.start()
+    print(f"✅ Webhook server listening on 0.0.0.0:{cfg['webhook_port']}")
+
+    # Start background flight check task
+    asyncio.create_task(hourly_flight_check(cfg, state))
+    print("✅ Hourly flight check started")
+
+    # Keep running
+    try:
+        await asyncio.Event().wait()
+    except KeyboardInterrupt:
+        print("🛑 Shutting down...")
+        await session.close()
+        await runner.cleanup()
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
