@@ -11,14 +11,40 @@ Features:
   - Admin commands: /approve, /reject, /revoke, /userlist, /users
 """
 
+print("[STARTUP] Script loaded, imports starting...")
+
 import asyncio
 import hashlib
 import json
+import logging
 import math
 import os
+import sys
 from datetime import datetime, timedelta
 from pathlib import Path
 from aiohttp import web, ClientSession, ClientTimeout
+
+# Write startup marker to file
+with open('/app/startup.txt', 'w') as f:
+    f.write('Script started at module import time\n')
+
+# Setup logging with unbuffered output AND file logging
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='[%(asctime)s] %(levelname)s: %(message)s',
+    datefmt='%H:%M:%S',
+    stream=sys.stdout,
+    force=True
+)
+# Also add file handler for persistent logs
+file_handler = logging.FileHandler('/app/bot.log')
+file_handler.setLevel(logging.DEBUG)
+formatter = logging.Formatter('[%(asctime)s] %(levelname)s: %(message)s', datefmt='%H:%M:%S')
+file_handler.setFormatter(formatter)
+logging.getLogger().addHandler(file_handler)
+
+logger = logging.getLogger(__name__)
+logger.info("Logging initialized")
 
 # ---------------------------------------------------------------------------
 # Constants & Config
@@ -28,7 +54,7 @@ CONFIG_PATH = Path(__file__).parent / "config.json"
 STATE_PATH = Path(__file__).parent / "state.json"
 
 TG_API = "https://api.telegram.org/bot{token}"
-AVIASALES_API = "https://api.travelpayouts.com/v3/prices_for_dates"
+AVIASALES_API = "https://api.travelpayouts.com/aviasales/v3/prices_for_dates"
 
 FOOTER = "\n\n_🤖 Flight Deals Bot_"
 
@@ -87,18 +113,26 @@ session: ClientSession = None
 
 def load_config() -> dict:
     """Load config from file and environment variables."""
+    logger.debug("🔧 load_config() called")
+
     cfg = {
         "aviasales_token": "",
         "telegram_bot_token": "",
         "admin_chat_id": "",
         "webhook_host": "",
-        "webhook_port": 8443,
+        "webhook_port": 443,  # Port for Telegram (in webhook URL)
+        "listen_port": 8080,  # Port for aiohttp server to listen on (CHANGED FROM 8443!)
         "webhook_path": "/webhook-flightdeals",
     }
+    logger.debug(f"📝 Default config: webhook_port={cfg['webhook_port']}, listen_port={cfg['listen_port']}")
 
     if CONFIG_PATH.exists():
+        logger.debug(f"📂 Loading config from {CONFIG_PATH}")
         with open(CONFIG_PATH, encoding="utf-8") as f:
-            cfg.update(json.load(f))
+            file_cfg = json.load(f)
+            logger.debug(f"📄 File config: {json.dumps(file_cfg)}")
+            cfg.update(file_cfg)
+        logger.debug(f"✅ After file update: webhook_port={cfg['webhook_port']}, listen_port={cfg['listen_port']}")
 
     # Environment overrides
     env_map = {
@@ -107,18 +141,26 @@ def load_config() -> dict:
         "TELEGRAM_CHAT_ID": "admin_chat_id",
         "WEBHOOK_HOST": "webhook_host",
         "WEBHOOK_PORT": "webhook_port",
+        "LISTEN_PORT": "listen_port",
         "WEBHOOK_PATH": "webhook_path",
     }
+    logger.debug("🌍 Checking environment variables...")
     for env_key, cfg_key in env_map.items():
         val = os.environ.get(env_key)
         if val:
-            if cfg_key == "webhook_port":
+            if cfg_key in ["webhook_port", "listen_port"]:
                 cfg[cfg_key] = int(val)
+                logger.debug(f"  {env_key}={val} → cfg['{cfg_key}']={cfg[cfg_key]} (int)")
             else:
                 cfg[cfg_key] = val
+                logger.debug(f"  {env_key}={val} → cfg['{cfg_key}']")
+        else:
+            logger.debug(f"  {env_key} not set")
 
     cfg["admin_chat_id"] = str(cfg.get("admin_chat_id", ""))
-    cfg["webhook_port"] = int(cfg.get("webhook_port", 8443))
+    cfg["webhook_port"] = int(cfg.get("webhook_port", 443))
+    cfg["listen_port"] = int(cfg.get("listen_port", 8080))
+    logger.debug(f"✅ Final config: webhook_port={cfg['webhook_port']}, listen_port={cfg['listen_port']}")
     return cfg
 
 
@@ -215,7 +257,7 @@ def filter_deals(tickets: list, settings: dict) -> list:
             continue
 
         # Check direct-only if enabled
-        if settings.get("direct_only") and not ticket.get("direct"):
+        if settings.get("direct_only") and ticket.get("transfers", 1) != 0:
             continue
 
         # Passed all filters
@@ -247,7 +289,7 @@ def format_deal(deal: dict, is_round_trip: bool = False) -> str:
         out_airline = outbound.get("airline", "")
         out_flight = outbound.get("flight_number", "")
         out_price = outbound.get("price", "?")
-        out_direct = "direct" if outbound.get("direct") else "1+ stops"
+        out_direct = "direct" if outbound.get("transfers", 1) == 0 else "1+ stops"
         out_url = outbound.get("search_url", "")
 
         msg += f"  → {origin} → {dest}\n"
@@ -270,7 +312,7 @@ def format_deal(deal: dict, is_round_trip: bool = False) -> str:
         ret_airline = ret.get("airline", "")
         ret_flight = ret.get("flight_number", "")
         ret_price = ret.get("price", "?")
-        ret_direct = "direct" if ret.get("direct") else "1+ stops"
+        ret_direct = "direct" if ret.get("transfers", 1) == 0 else "1+ stops"
         ret_url = ret.get("search_url", "")
 
         msg += f"  ← {dest} → {origin}\n"
@@ -293,7 +335,7 @@ def format_deal(deal: dict, is_round_trip: bool = False) -> str:
         hours = duration // 60
         mins = duration % 60
         duration_str = f"{hours}h{mins:02d}m"
-        direct = "direct" if deal.get("direct") else "1+ stops"
+        direct = "direct" if deal.get("transfers", 1) == 0 else "1+ stops"
         airline = deal.get("airline", "")
         flight = deal.get("flight_number", "")
         url = deal.get("search_url", "")
@@ -315,6 +357,7 @@ def format_deal(deal: dict, is_round_trip: bool = False) -> str:
 
 async def send_tg(text: str, chat_id: str, cfg: dict, parse_mode: str = "Markdown") -> bool:
     """Send message via Telegram API."""
+    logger.debug(f"📤 send_tg called: chat_id={chat_id}, text_len={len(text)}, parse_mode={parse_mode}")
     text = text + FOOTER
     payload = {
         "chat_id": str(chat_id),
@@ -323,15 +366,20 @@ async def send_tg(text: str, chat_id: str, cfg: dict, parse_mode: str = "Markdow
         "parse_mode": parse_mode,
     }
     try:
+        logger.debug(f"📲 Posting message to Telegram API for chat_id={chat_id}")
         async with session.post(
             f"{TG_API.format(token=cfg['telegram_bot_token'])}/sendMessage",
             json=payload,
             timeout=ClientTimeout(total=15)
         ) as resp:
+            logger.debug(f"📊 Telegram API response: status={resp.status}")
             if resp.status == 200:
+                logger.debug(f"✅ Message sent successfully to {chat_id}")
                 return True
+            else:
+                logger.error(f"❌ Telegram API returned status {resp.status}")
     except Exception as e:
-        print(f"❌ send_tg error: {e}")
+        logger.error(f"❌ send_tg error: {e}", exc_info=True)
     return False
 
 
@@ -341,7 +389,13 @@ async def set_webhook(cfg: dict) -> None:
         print("⚠️ webhook_host not set, skipping webhook registration")
         return
 
-    url = f"{cfg['webhook_host']}:{cfg['webhook_port']}{cfg['webhook_path']}"
+    # Don't add port if it's 443 (standard HTTPS)
+    port = cfg.get("webhook_port", 443)
+    if port == 443:
+        url = f"{cfg['webhook_host']}{cfg['webhook_path']}"
+    else:
+        url = f"{cfg['webhook_host']}:{port}{cfg['webhook_path']}"
+
     payload = {"url": url}
 
     try:
@@ -371,7 +425,6 @@ async def fetch_flights(departure_month: str, origin: str, destination: str, cfg
     """
     params = {
         "origin": origin,
-        "destination": destination,
         "departure_at": departure_month,
         "one_way": "true",
         "currency": settings.get("currency", "eur"),
@@ -381,8 +434,14 @@ async def fetch_flights(departure_month: str, origin: str, destination: str, cfg
         "token": cfg["aviasales_token"],
     }
 
+    if destination:
+        params["destination"] = destination
+
     if settings.get("direct_only"):
         params["direct"] = "true"
+
+    logger.debug(f"🔍 fetch_flights: {origin} → {destination if destination else '(любой)'} | {departure_month}")
+    logger.debug(f"   Параметры: {params}")
 
     try:
         async with session.get(
@@ -390,21 +449,28 @@ async def fetch_flights(departure_month: str, origin: str, destination: str, cfg
             params=params,
             timeout=ClientTimeout(total=30)
         ) as resp:
+            logger.debug(f"   API статус: {resp.status}")
             if resp.status == 200:
                 data = await resp.json()
+                logger.debug(f"   API ответ: success={data.get('success')}, flights={len(data.get('data', []))}")
                 if data.get("success"):
                     return data.get("data", [])
+            else:
+                text = await resp.text()
+                logger.error(f"   API ошибка: {resp.status} - {text[:200]}")
     except Exception as e:
-        print(f"❌ fetch_flights error: {e}")
+        logger.error(f"❌ fetch_flights error: {e}")
 
     return []
 
 
 async def search_for_user(chat_id: str, state: dict, cfg: dict) -> None:
     """Search for flights for a single user."""
+    logger.info(f"🔍 search_for_user called for {chat_id}")
     user_data = state["users"].get(str(chat_id), {})
     settings = user_settings(state, chat_id)
     sent_hashes = set(user_data.get("sent_deals", []))
+    logger.debug(f"   Settings: origin={settings['origin']}, destination={settings.get('destination')}")
 
     origin = settings["origin"]
     destination = settings.get("destination", "").strip().upper()
@@ -532,7 +598,7 @@ async def search_for_user(chat_id: str, state: dict, cfg: dict) -> None:
         await send_tg(text, chat_id, cfg)
 
         # Update sent deals
-        user_data["sent_deals"] = sent_hashes | {d[0].get("_hash") for d in all_new}
+        user_data["sent_deals"] = list(sent_hashes | {d[0].get("_hash") for d in all_new})
         state["users"][str(chat_id)] = user_data
 
 
@@ -540,13 +606,18 @@ async def hourly_flight_check(cfg: dict, state: dict) -> None:
     """Background task: check flights for all users every hour."""
     while True:
         print(f"🔍 Hourly check for {len(state['users'])} user(s)…")
+        logger.info(f"🔍 Hourly flight check starting for {len(state['users'])} user(s)")
         for chat_id in list(state["users"].keys()):
             try:
+                logger.debug(f"  Checking user {chat_id}...")
                 await search_for_user(chat_id, state, cfg)
+                logger.debug(f"  ✅ Completed for {chat_id}")
             except Exception as e:
                 print(f"  ❌ Error for {chat_id}: {e}")
+                logger.error(f"  ❌ Error for {chat_id}: {e}", exc_info=True)
 
         save_state(state, cfg)
+        logger.info(f"✅ Hourly check completed, sleeping for 1 hour...")
         await asyncio.sleep(3600)  # 1 hour
 
 
@@ -556,9 +627,12 @@ async def hourly_flight_check(cfg: dict, state: dict) -> None:
 
 async def process_single_update(update: dict, cfg: dict, state: dict) -> None:
     """Process a single Telegram update."""
+    logger.debug(f"🔍 process_single_update called, update keys: {update.keys()}")
+
     # Extract message and user info
     message = update.get("message")
     if not message:
+        logger.debug("⚠️ No message in update, returning")
         return
 
     chat_id = str(message.get("chat", {}).get("id", ""))
@@ -568,26 +642,32 @@ async def process_single_update(update: dict, cfg: dict, state: dict) -> None:
     first_name = user.get("first_name", "")
 
     text = (message.get("text", "") or "").strip()
+    logger.debug(f"📝 Message from {chat_id} ({first_name}/@{username}): '{text}'")
 
     if not text:
+        logger.debug("⚠️ Empty message text, returning")
         return
 
     # Parse command
     cmd_parts = text.split(None, 1)
     cmd = cmd_parts[0].lower()
     arg = cmd_parts[1] if len(cmd_parts) > 1 else ""
+    logger.debug(f"🎯 Parsed command: cmd='{cmd}', arg='{arg}'")
 
     admin_id = cfg.get("admin_chat_id", "")
     is_admin = str(chat_id) == admin_id
+    logger.debug(f"👤 User status: admin={is_admin}, admin_id={admin_id}")
 
     # Check if user is revoked
     if str(chat_id) in state["revoked"]:
+        logger.debug(f"🚫 User {chat_id} is revoked")
         if cmd == "/start":
             await send_tg("⛔ Ваш доступ был отозван.", chat_id, cfg)
         return
 
     # Check if user is approved
     is_approved = str(chat_id) in state["users"]
+    logger.debug(f"✅ User approval status: approved={is_approved}, total_users={len(state['users'])}")
 
     # Pending users
     if not is_approved and str(chat_id) in state["pending"]:
@@ -726,12 +806,18 @@ async def process_single_update(update: dict, cfg: dict, state: dict) -> None:
             return
 
     # User commands (approved users)
+    logger.debug(f"🎮 Checking user commands for: {cmd}")
+
     if cmd == "/start" or cmd == "/help":
+        logger.debug(f"📖 Executing /help command for user {chat_id}")
         await send_tg(HELP_TEXT, chat_id, cfg)
+        logger.debug(f"✅ /help sent to {chat_id}")
         return
 
     if cmd == "/settings":
+        logger.debug(f"⚙️ Executing /settings command for user {chat_id}")
         s = user_settings(state, chat_id)
+        logger.debug(f"📊 User settings loaded: {json.dumps(s)}")
         dest = s.get("destination", "")
         trip_type = f"туда-обратно ({dest})" if dest else "в одну сторону"
 
@@ -745,27 +831,36 @@ async def process_single_update(update: dict, cfg: dict, state: dict) -> None:
             f"📈 Доп. €/30мин: {s['price_increment_eur']}€\n"
             f"🎯 Только прямые: {'✅' if s['direct_only'] else '❌'}\n"
         )
+        logger.debug(f"📨 Sending settings message to {chat_id}")
         await send_tg(text, chat_id, cfg)
+        logger.debug(f"✅ /settings sent to {chat_id}")
         return
 
     if cmd == "/reset":
+        logger.debug(f"🔄 Executing /reset command for user {chat_id}")
         state["users"][str(chat_id)]["sent_deals"] = []
         await send_tg("✅ История отправленных сделок очищена.", chat_id, cfg)
+        logger.debug(f"✅ /reset executed for {chat_id}")
         return
 
     if cmd == "/direct":
+        logger.debug(f"🎯 Executing /direct command for user {chat_id}")
         settings = user_settings(state, chat_id)
         settings["direct_only"] = not settings.get("direct_only", False)
         state["users"][str(chat_id)]["settings"] = settings
         status = "✅ включены" if settings["direct_only"] else "❌ отключены"
         await send_tg(f"Только прямые рейсы: {status}", chat_id, cfg)
+        logger.debug(f"✅ /direct executed for {chat_id}")
         return
 
     # Settings commands
     if cmd in COMMAND_MAP:
+        logger.debug(f"⚙️ Processing COMMAND_MAP command: {cmd} = {arg}")
         key, vtype = COMMAND_MAP[cmd]
+        logger.debug(f"📝 Command mapped to key='{key}', vtype={vtype}")
 
         if not arg:
+            logger.debug(f"❌ No argument provided for {cmd}")
             await send_tg(f"⚠️ Укажите значение: {cmd} <значение>", chat_id, cfg)
             return
 
@@ -774,24 +869,31 @@ async def process_single_update(update: dict, cfg: dict, state: dict) -> None:
                 # Special handling for destination
                 if arg.lower() == "off" or arg == "":
                     val = ""
+                    logger.debug(f"🔄 Clearing destination")
                 else:
                     val = arg.upper()
                     if len(val) != 3:
+                        logger.debug(f"❌ Invalid destination code length: {val}")
                         await send_tg("⚠️ Код назначения должен быть 3 буквы (IATA)", chat_id, cfg)
                         return
+                    logger.debug(f"🔄 Setting destination to {val}")
 
             elif key == "days_ahead":
                 val = int(arg)
                 if val < 1 or val > 90:
+                    logger.debug(f"❌ days_ahead out of range: {val}")
                     await send_tg("⚠️ /days должна быть от 1 до 90", chat_id, cfg)
                     return
+                logger.debug(f"🔄 Setting days_ahead to {val}")
 
             else:
                 val = vtype(arg)
+                logger.debug(f"🔄 Setting {key} to {val}")
 
             settings = user_settings(state, chat_id)
             settings[key] = val
             state["users"][str(chat_id)]["settings"] = settings
+            logger.debug(f"💾 Settings saved for user {chat_id}: {key}={val}")
 
             if key == "destination":
                 if val:
@@ -800,17 +902,21 @@ async def process_single_update(update: dict, cfg: dict, state: dict) -> None:
                     await send_tg(f"✅ Туда-обратно отключено (только в одну сторону)", chat_id, cfg)
             else:
                 await send_tg(f"✅ {cmd} установлена на {val}", chat_id, cfg)
+            logger.debug(f"✅ Confirmation sent to {chat_id}")
 
-        except ValueError:
+        except ValueError as e:
+            logger.error(f"❌ ValueError for {cmd}: {e}")
             await send_tg(f"⚠️ Неверное значение для {cmd}", chat_id, cfg)
 
         return
 
     # Unknown command
+    logger.debug(f"❓ Unknown command received: {cmd}")
     await send_tg(
         "❓ Неизвестная команда. /help для справки.",
         chat_id, cfg
     )
+    logger.debug(f"✅ Unknown command message sent to {chat_id}")
 
 
 # ---------------------------------------------------------------------------
@@ -819,16 +925,21 @@ async def process_single_update(update: dict, cfg: dict, state: dict) -> None:
 
 async def handle_webhook(request):
     """Handle incoming Telegram webhook updates."""
+    logger.debug("🔔 Webhook received")
     try:
         data = await request.json()
+        logger.debug(f"📨 Raw webhook data: {json.dumps(data)}")
+
         # We need to pass state and cfg somehow
         # Store them in app context
         state = request.app["state"]
         cfg = request.app["cfg"]
 
+        logger.debug(f"⚙️ Calling process_single_update with data keys: {data.keys()}")
         await process_single_update(data, cfg, state)
+        logger.debug("✅ process_single_update completed")
     except Exception as e:
-        print(f"❌ Webhook handler error: {e}")
+        logger.error(f"❌ Webhook handler error: {e}", exc_info=True)
 
     return web.Response(text="ok")
 
@@ -841,13 +952,21 @@ async def main():
     """Main entry point."""
     global session
 
+    logger.info("🚀 Starting Flight Deals bot")
     cfg = load_config()
+    logger.info(f"⚙️ Config loaded: webhook_port={cfg.get('webhook_port')}, listen_port={cfg.get('listen_port')}")
+    logger.info(f"📋 Full config keys: {list(cfg.keys())}")
+    logger.debug(f"🔧 Full config: {json.dumps({k: v for k, v in cfg.items() if k != 'telegram_bot_token'})}")
+
     state = load_state(cfg)
+    logger.info(f"📂 State loaded: {len(state.get('users', {}))} users")
 
     # Create HTTP session
     session = ClientSession()
+    logger.debug("📡 HTTP session created")
 
     # Set webhook
+    logger.debug("🔌 Setting webhook...")
     await set_webhook(cfg)
 
     # Create web app
@@ -857,15 +976,28 @@ async def main():
     app.router.add_post(cfg["webhook_path"], handle_webhook)
 
     # Start web server
+    logger.info(f"🌐 Starting web server on port {cfg['listen_port']}")
+    logger.debug(f"📍 Before TCPSite: listen_port type={type(cfg['listen_port'])}, value={cfg['listen_port']}")
+
     runner = web.AppRunner(app)
     await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", cfg["webhook_port"])
+    logger.debug("✅ AppRunner setup complete")
+
+    listen_port = cfg["listen_port"]
+    logger.info(f"🔗 Creating TCPSite on 0.0.0.0:{listen_port}")
+    site = web.TCPSite(runner, "0.0.0.0", listen_port)
+    logger.debug("⏳ Calling site.start()...")
     await site.start()
-    print(f"✅ Webhook server listening on 0.0.0.0:{cfg['webhook_port']}")
+    logger.info(f"✅ Webhook server listening on 0.0.0.0:{listen_port}")
+    logger.info("🔴 AFTER site.start() - about to create task")
+    import sys; sys.stdout.flush()
 
     # Start background flight check task
+    logger.info("🔴 Creating hourly_flight_check task...")
     asyncio.create_task(hourly_flight_check(cfg, state))
+    logger.info("🔴 Task created")
     print("✅ Hourly flight check started")
+    sys.stdout.flush()
 
     # Keep running
     try:
