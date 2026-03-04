@@ -257,7 +257,7 @@ def filter_deals(tickets: list, settings: dict) -> list:
             continue
 
         # Check direct-only if enabled
-        if settings.get("direct_only") and not ticket.get("direct"):
+        if settings.get("direct_only") and ticket.get("transfers", 1) != 0:
             continue
 
         # Passed all filters
@@ -289,7 +289,7 @@ def format_deal(deal: dict, is_round_trip: bool = False) -> str:
         out_airline = outbound.get("airline", "")
         out_flight = outbound.get("flight_number", "")
         out_price = outbound.get("price", "?")
-        out_direct = "direct" if outbound.get("direct") else "1+ stops"
+        out_direct = "direct" if outbound.get("transfers", 1) == 0 else "1+ stops"
         out_url = outbound.get("search_url", "")
 
         msg += f"  → {origin} → {dest}\n"
@@ -312,7 +312,7 @@ def format_deal(deal: dict, is_round_trip: bool = False) -> str:
         ret_airline = ret.get("airline", "")
         ret_flight = ret.get("flight_number", "")
         ret_price = ret.get("price", "?")
-        ret_direct = "direct" if ret.get("direct") else "1+ stops"
+        ret_direct = "direct" if ret.get("transfers", 1) == 0 else "1+ stops"
         ret_url = ret.get("search_url", "")
 
         msg += f"  ← {dest} → {origin}\n"
@@ -335,7 +335,7 @@ def format_deal(deal: dict, is_round_trip: bool = False) -> str:
         hours = duration // 60
         mins = duration % 60
         duration_str = f"{hours}h{mins:02d}m"
-        direct = "direct" if deal.get("direct") else "1+ stops"
+        direct = "direct" if deal.get("transfers", 1) == 0 else "1+ stops"
         airline = deal.get("airline", "")
         flight = deal.get("flight_number", "")
         url = deal.get("search_url", "")
@@ -425,7 +425,6 @@ async def fetch_flights(departure_month: str, origin: str, destination: str, cfg
     """
     params = {
         "origin": origin,
-        "destination": destination,
         "departure_at": departure_month,
         "one_way": "true",
         "currency": settings.get("currency", "eur"),
@@ -434,6 +433,9 @@ async def fetch_flights(departure_month: str, origin: str, destination: str, cfg
         "sorting": "price",
         "token": cfg["aviasales_token"],
     }
+
+    if destination:
+        params["destination"] = destination
 
     if settings.get("direct_only"):
         params["direct"] = "true"
@@ -596,7 +598,7 @@ async def search_for_user(chat_id: str, state: dict, cfg: dict) -> None:
         await send_tg(text, chat_id, cfg)
 
         # Update sent deals
-        user_data["sent_deals"] = sent_hashes | {d[0].get("_hash") for d in all_new}
+        user_data["sent_deals"] = list(sent_hashes | {d[0].get("_hash") for d in all_new})
         state["users"][str(chat_id)] = user_data
 
 
