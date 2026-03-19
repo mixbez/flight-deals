@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.9] — 2026-03-19
+
+### Changed
+- `/start` now shows the full command list (same as `/help`); admin users also see admin commands
+- Deal messages: raw URL replaced with `[link](url)` Markdown hyperlink
+- Deal messages: removed "Flight Deals Bot" footer from all messages; `by aboutmisha.com` remains, shown inline with the link
+- Removed global `FOOTER` constant — it was appended to every message including non-deal ones
+
 ## [1.8] — 2026-03-19
 
 ### Added

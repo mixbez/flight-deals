@@ -11,7 +11,7 @@ Features:
   - Admin commands: /approve, /reject, /revoke, /userlist, /users
 """
 
-__version__ = "1.8"
+__version__ = "1.9"
 
 print("[STARTUP] Script loaded, imports starting...")
 
@@ -167,8 +167,6 @@ STATE_PATH = Path("/app/data") / "state.json"
 
 TG_API = "https://api.telegram.org/bot{token}"
 AVIASALES_API = "https://api.travelpayouts.com/aviasales/v3/prices_for_dates"
-
-FOOTER = "\n\n_🤖 Flight Deals Bot_"
 
 HELP_TEXT = """🤖 *Команды:*
 
@@ -475,8 +473,6 @@ def format_deal(deal: dict, is_round_trip: bool = False) -> str:
         msg += f"    💰 {out_price} EUR\n"
         if out_airline and out_flight:
             msg += f"    {out_airline} {out_flight}\n"
-        if out_url:
-            msg += f"    {out_url}\n"
 
         msg += "\n"
 
@@ -491,7 +487,7 @@ def format_deal(deal: dict, is_round_trip: bool = False) -> str:
         ret_flight = ret.get("flight_number", "")
         ret_price = ret.get("price", "?")
         ret_direct = "direct" if ret.get("transfers", 1) == 0 else "1+ stops"
-        ret_url = ret.get("search_url", "")
+        ret_url = ret.get("search_url", "") or out_url  # fallback to outbound URL if no return URL
 
         msg += f"  ← {dest} → {origin}\n"
         msg += f"    {ret_date} {ret_time} | {ret_duration_str} | {ret_direct}\n"
@@ -499,8 +495,9 @@ def format_deal(deal: dict, is_round_trip: bool = False) -> str:
         if ret_airline and ret_flight:
             msg += f"    {ret_airline} {ret_flight}\n"
         if ret_url:
-            msg += f"    {ret_url}\n"
-        msg += f"   by aboutmisha.com\n"
+            msg += f"[link]({ret_url}) · by aboutmisha.com\n"
+        else:
+            msg += f"by aboutmisha.com\n"
 
         return msg
     else:
@@ -525,8 +522,9 @@ def format_deal(deal: dict, is_round_trip: bool = False) -> str:
         if airline and flight:
             msg += f"   {airline} {flight}\n"
         if url:
-            msg += f"   {url}\n"
-        msg += f"   by aboutmisha.com\n"
+            msg += f"[link]({url}) · by aboutmisha.com\n"
+        else:
+            msg += f"by aboutmisha.com\n"
 
         return msg
 
@@ -542,7 +540,6 @@ async def send_tg(text: str, chat_id: str, cfg: dict, parse_mode: str = "Markdow
         {"inline_keyboard": [[{"text": "Button", "callback_data": "data"}]]}
     """
     logger.debug(f"📤 send_tg called: chat_id={chat_id}, text_len={len(text)}, parse_mode={parse_mode}")
-    text = text + FOOTER
     payload = {
         "chat_id": str(chat_id),
         "text": text,
@@ -1170,7 +1167,10 @@ async def process_single_update(update: dict, cfg: dict, state: dict) -> None:
 
     if cmd == "/start" or cmd == "/help":
         logger.debug(f"📖 Executing /help command for user {chat_id}")
-        await send_tg(HELP_TEXT, chat_id, cfg)
+        msg = HELP_TEXT
+        if is_admin:
+            msg += "\n" + ADMIN_HELP
+        await send_tg(msg, chat_id, cfg)
         logger.debug(f"✅ /help sent to {chat_id}")
         return
 
