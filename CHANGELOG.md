@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.2] — 2026-03-19
+
+### Added
+- Admin command `/approval on|off` — toggle whether new users require manual approval
+- When approval is off, `/start` auto-approves new users immediately
+- `/approval` with no argument shows current status
+
 ## [1.1] — 2026-03-19
 
 ### Added
