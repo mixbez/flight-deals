@@ -1,5 +1,10 @@
 # Changelog
 
+## [2.1] — 2026-03-19
+
+### Added
+- Admin command `/announce TEXT` — broadcasts a message to all users with Markdown preserved
+
 ## [2.0] — 2026-03-19
 
 ### Added
