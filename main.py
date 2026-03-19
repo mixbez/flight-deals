@@ -11,7 +11,7 @@ Features:
   - Admin commands: /approve, /reject, /revoke, /userlist, /users
 """
 
-__version__ = "1.1"
+__version__ = "1.2"
 
 print("[STARTUP] Script loaded, imports starting...")
 
@@ -80,7 +80,8 @@ ADMIN_HELP = """
 /reject ID — отклонить
 /revoke ID — удалить пользователя (бан)
 /users — список пользователей
-/userlist — все ID пользователей"""
+/userlist — все ID пользователей
+/approval on|off — вкл/выкл обязательное одобрение"""
 
 DEFAULT_USER_SETTINGS = {
     "origin": "BUD",
@@ -173,6 +174,7 @@ def empty_state() -> dict:
         "pending": {},
         "revoked": {},
         "last_update_id": 0,
+        "approval_required": True,
     }
 
 
@@ -730,15 +732,27 @@ async def process_single_update(update: dict, cfg: dict, state: dict) -> None:
 
     # New user
     if not is_approved and cmd == "/start":
-        state["pending"][str(chat_id)] = {
-            "name": first_name,
-            "username": username,
-            "state": "awaiting_referral",
-        }
-        await send_tg(
-            "Откуда вы узнали про бота? Поделитесь, пожалуйста 🙏",
-            chat_id, cfg
-        )
+        if not state.get("approval_required", True):
+            # Open access: auto-approve immediately
+            state["users"][str(chat_id)] = {
+                "name": first_name,
+                "username": username,
+                "referral_answer": "",
+                "settings": DEFAULT_USER_SETTINGS.copy(),
+                "sent_deals": [],
+            }
+            save_state(state, cfg)
+            await send_tg("✅ Добро пожаловать! /help для справки.", chat_id, cfg)
+        else:
+            state["pending"][str(chat_id)] = {
+                "name": first_name,
+                "username": username,
+                "state": "awaiting_referral",
+            }
+            await send_tg(
+                "Откуда вы узнали про бота? Поделитесь, пожалуйста 🙏",
+                chat_id, cfg
+            )
         return
 
     # Only approved users and admins beyond this point
@@ -822,6 +836,21 @@ async def process_single_update(update: dict, cfg: dict, state: dict) -> None:
                 f"📋 Все ID пользователей:\n\n{user_ids}\n\nВсего: {len(state['users'])}",
                 chat_id, cfg
             )
+            return
+
+        elif cmd == "/approval":
+            val = arg.strip().lower()
+            if val == "off":
+                state["approval_required"] = False
+                save_state(state, cfg)
+                await send_tg("🔓 Одобрение отключено — любой может вступить.", chat_id, cfg)
+            elif val == "on":
+                state["approval_required"] = True
+                save_state(state, cfg)
+                await send_tg("🔒 Одобрение включено — новые пользователи требуют проверки.", chat_id, cfg)
+            else:
+                status = "🔒 включено" if state.get("approval_required", True) else "🔓 отключено"
+                await send_tg(f"Одобрение сейчас: {status}\n\n/approval on — включить\n/approval off — отключить", chat_id, cfg)
             return
 
         elif cmd == "/require":
