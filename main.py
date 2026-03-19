@@ -11,7 +11,7 @@ Features:
   - Admin commands: /approve, /reject, /revoke, /userlist, /users
 """
 
-__version__ = "1.2"
+__version__ = "1.3"
 
 print("[STARTUP] Script loaded, imports starting...")
 
@@ -72,6 +72,10 @@ HELP_TEXT = """🤖 *Команды:*
 /direct — вкл/выкл только прямые
 /settings — текущие настройки
 /reset — сбросить историю отправленных
+/savepreset NAME — сохранить текущие настройки как пресет
+/loadpreset NAME — загрузить пресет
+/deletepreset NAME — удалить пресет
+/mypresets — список пресетов
 /help — справка"""
 
 ADMIN_HELP = """
@@ -1000,6 +1004,86 @@ async def process_single_update(update: dict, cfg: dict, state: dict) -> None:
             logger.error(f"❌ ValueError for {cmd}: {e}")
             await send_tg(f"⚠️ Неверное значение для {cmd}", chat_id, cfg)
 
+        return
+
+    MAX_PRESETS = 5
+
+    if cmd == "/savepreset":
+        name = arg.strip()
+        if not name:
+            await send_tg("⚠️ Укажите название: /savepreset NAME", chat_id, cfg)
+            return
+        if not name.replace("_", "").replace("-", "").isalnum():
+            await send_tg("⚠️ Название может содержать только буквы, цифры, - и _", chat_id, cfg)
+            return
+        user_data = state["users"][str(chat_id)]
+        presets = user_data.setdefault("presets", {})
+        if name not in presets and len(presets) >= MAX_PRESETS:
+            names = ", ".join(f"`{n}`" for n in presets)
+            await send_tg(
+                f"⚠️ Максимум {MAX_PRESETS} пресетов. Удалите один:\n{names}\n\n/deletepreset NAME",
+                chat_id, cfg
+            )
+            return
+        presets[name] = user_settings(state, chat_id).copy()
+        save_state(state, cfg)
+        await send_tg(f"✅ Пресет `{name}` сохранён.", chat_id, cfg)
+        return
+
+    if cmd == "/loadpreset":
+        name = arg.strip()
+        if not name:
+            await send_tg("⚠️ Укажите название: /loadpreset NAME", chat_id, cfg)
+            return
+        presets = state["users"][str(chat_id)].get("presets", {})
+        if name not in presets:
+            await send_tg(f"❌ Пресет `{name}` не найден. /mypresets — список пресетов.", chat_id, cfg)
+            return
+        loaded = presets[name]
+        state["users"][str(chat_id)]["settings"] = loaded.copy()
+        save_state(state, cfg)
+        s = loaded
+        dest = s.get("destination", "")
+        trip_type = f"туда-обратно ({dest})" if dest else "в одну сторону"
+        text = (
+            f"✅ Пресет `{name}` загружен:\n\n"
+            f"✈️ Вылет: `{s['origin']}`\n"
+            f"🔄 Тип: {trip_type}\n"
+            f"📅 Дней вперёд: {s['days_ahead']}\n"
+            f"💰 Базовая цена: {s['base_price_eur']}€\n"
+            f"⏱️ Макс. длина: {s['base_duration_minutes']}мин\n"
+            f"📈 Доп. €/30мин: {s['price_increment_eur']}€\n"
+            f"🎯 Только прямые: {'✅' if s.get('direct_only') else '❌'}\n"
+        )
+        await send_tg(text, chat_id, cfg)
+        return
+
+    if cmd == "/deletepreset":
+        name = arg.strip()
+        if not name:
+            await send_tg("⚠️ Укажите название: /deletepreset NAME", chat_id, cfg)
+            return
+        presets = state["users"][str(chat_id)].get("presets", {})
+        if name not in presets:
+            await send_tg(f"❌ Пресет `{name}` не найден. /mypresets — список пресетов.", chat_id, cfg)
+            return
+        del presets[name]
+        save_state(state, cfg)
+        await send_tg(f"🗑 Пресет `{name}` удалён.", chat_id, cfg)
+        return
+
+    if cmd == "/mypresets":
+        presets = state["users"][str(chat_id)].get("presets", {})
+        if not presets:
+            await send_tg("У вас нет сохранённых пресетов.\n\n/savepreset NAME — сохранить текущие настройки.", chat_id, cfg)
+            return
+        lines = [f"📋 *Ваши пресеты* ({len(presets)}/{MAX_PRESETS}):\n"]
+        for name, s in presets.items():
+            dest = s.get("destination", "")
+            trip = f"↔ {dest}" if dest else "→"
+            lines.append(f"• `{name}` — {s['origin']} {trip}, {s['base_price_eur']}€ base, {s['days_ahead']}d")
+        lines.append("\n/loadpreset NAME — загрузить\n/deletepreset NAME — удалить")
+        await send_tg("\n".join(lines), chat_id, cfg)
         return
 
     # Unknown command
