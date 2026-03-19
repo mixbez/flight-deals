@@ -11,6 +11,8 @@ Features:
   - Admin commands: /approve, /reject, /revoke, /userlist, /users
 """
 
+__version__ = "1.1"
+
 print("[STARTUP] Script loaded, imports starting...")
 
 import asyncio
@@ -634,8 +636,8 @@ async def hourly_flight_check(cfg: dict, state: dict) -> None:
                 logger.error(f"  ❌ Error for {chat_id}: {e}", exc_info=True)
 
         save_state(state, cfg)
-        logger.info(f"✅ Hourly check completed, sleeping for 60 seconds...")
-        await asyncio.sleep(60)  # TEST: 60 seconds (normally 3600 for 1 hour)
+        logger.info(f"✅ Hourly check completed, sleeping for 3600 seconds...")
+        await asyncio.sleep(3600)
 
 
 # ---------------------------------------------------------------------------
