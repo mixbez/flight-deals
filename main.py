@@ -11,7 +11,7 @@ Features:
   - Admin commands: /approve, /reject, /revoke, /userlist, /users
 """
 
-__version__ = "1.4"
+__version__ = "1.5"
 
 print("[STARTUP] Script loaded, imports starting...")
 
@@ -64,6 +64,7 @@ HELP_TEXT = """🤖 *Команды:*
 
 /origin XXX — город вылета (IATA)
 /destination XXX — город назначения (IATA, для туда-обратно)
+/destination ANY — туда-обратно везде (любое направление)
 /destination off — отключить туда-обратно (только в одну сторону)
 /days N — окно поиска (дней вперёд, 1–90)
 /price N — лимит цены за сегмент (€)
@@ -213,6 +214,15 @@ def user_settings(state: dict, chat_id: str) -> dict:
     user = state["users"].get(str(chat_id), {})
     settings = user.get("settings", {})
     return {**DEFAULT_USER_SETTINGS, **settings}
+
+
+def trip_type_label(dest: str) -> str:
+    """Human-readable trip type for a destination value."""
+    if dest == "ANY":
+        return "туда-обратно (везде)"
+    elif dest:
+        return f"туда-обратно ({dest})"
+    return "в одну сторону"
 
 
 def deal_hash(deal: dict) -> str:
@@ -516,7 +526,90 @@ async def search_for_user(chat_id: str, state: dict, cfg: dict, notify_if_empty:
 
     all_new = []
 
-    if not destination:
+    if destination == "ANY":
+        # Everywhere round-trip mode:
+        # 1. Fetch outbound tickets with no destination filter
+        # 2. For each unique destination found, fetch return tickets
+        # 3. Combine date pairs within trip days range
+        min_trip = settings.get("min_trip_days", 1)
+        max_trip = settings.get("max_trip_days", 30)
+        limit_per_segment = settings["base_price_eur"]
+        MAX_DESTINATIONS = 20  # cap API calls
+
+        for month_str in sorted(months_to_fetch):
+            outbound_tickets = await fetch_flights(month_str, origin, "", cfg, settings)
+
+            # Group filtered outbound tickets by destination and date
+            outbound_by_dest_date: dict = {}
+            for ticket in outbound_tickets:
+                dep_date_str = ticket.get("departure_at", "").split("T")[0]
+                dest_city = ticket.get("destination", "")
+                if not dep_date_str or not dest_city:
+                    continue
+                try:
+                    dep_date = datetime.fromisoformat(dep_date_str).date()
+                except Exception:
+                    continue
+                if dep_date < today or dep_date > end_date:
+                    continue
+                deals = filter_deals([ticket], settings)
+                if deals:
+                    key = (dest_city, dep_date)
+                    outbound_by_dest_date.setdefault(key, []).extend(deals)
+
+            # Collect unique destinations (cheapest first)
+            dest_min_price: dict = {}
+            for (dest_city, dep_date), deals in outbound_by_dest_date.items():
+                min_p = min(d.get("price", 9999) for d in deals)
+                if dest_city not in dest_min_price or min_p < dest_min_price[dest_city]:
+                    dest_min_price[dest_city] = min_p
+            top_dests = sorted(dest_min_price, key=lambda d: dest_min_price[d])[:MAX_DESTINATIONS]
+
+            # Fetch return legs for each top destination
+            for dest_city in top_dests:
+                return_tickets = await fetch_flights(month_str, dest_city, origin, cfg, settings)
+                await asyncio.sleep(0.2)
+
+                return_by_date: dict = {}
+                for ticket in return_tickets:
+                    dep_date_str = ticket.get("departure_at", "").split("T")[0]
+                    if not dep_date_str:
+                        continue
+                    try:
+                        dep_date = datetime.fromisoformat(dep_date_str).date()
+                    except Exception:
+                        continue
+                    if dep_date < today or dep_date > end_date:
+                        continue
+                    deals = filter_deals([ticket], settings)
+                    if deals:
+                        return_by_date.setdefault(dep_date, []).extend(deals)
+
+                # Combine
+                for (d_city, out_date), out_deals in outbound_by_dest_date.items():
+                    if d_city != dest_city:
+                        continue
+                    for ret_date, ret_deals in return_by_date.items():
+                        trip_length = (ret_date - out_date).days
+                        if trip_length < min_trip or trip_length > max_trip:
+                            continue
+                        for out_deal in out_deals:
+                            for ret_deal in ret_deals:
+                                total_price = out_deal.get("price", 0) + ret_deal.get("price", 0)
+                                if total_price <= 2 * limit_per_segment:
+                                    combo = {
+                                        "_outbound": out_deal,
+                                        "_return": ret_deal,
+                                        "_total_price": total_price,
+                                    }
+                                    h = deal_hash(combo)
+                                    if h not in sent_hashes:
+                                        combo["_hash"] = h
+                                        all_new.append((combo, True))
+
+            await asyncio.sleep(0.2)
+
+    elif not destination:
         # One-way mode
         for month_str in sorted(months_to_fetch):
             tickets = await fetch_flights(month_str, origin, "", cfg, settings)
@@ -823,7 +916,7 @@ async def process_single_update(update: dict, cfg: dict, state: dict) -> None:
             for uid, udata in sorted(state["users"].items()):
                 s = user_settings(state, uid)
                 dest = s.get("destination", "")
-                trip_type = f"туда-обратно ({dest})" if dest else "в одну сторону"
+                trip_type = trip_type_label(dest)
                 text += (
                     f"*{udata['name']}* (@{udata.get('username', 'N/A')})\n"
                     f"  ID: `{uid}`\n"
@@ -924,7 +1017,7 @@ async def process_single_update(update: dict, cfg: dict, state: dict) -> None:
         s = user_settings(state, chat_id)
         logger.debug(f"📊 User settings loaded: {json.dumps(s)}")
         dest = s.get("destination", "")
-        trip_type = f"туда-обратно ({dest})" if dest else "в одну сторону"
+        trip_type = trip_type_label(dest)
 
         text = (
             f"⚙️ *Ваши настройки:*\n\n"
@@ -998,11 +1091,14 @@ async def process_single_update(update: dict, cfg: dict, state: dict) -> None:
                 if arg.lower() == "off" or arg == "":
                     val = ""
                     logger.debug(f"🔄 Clearing destination")
+                elif arg.upper() == "ANY":
+                    val = "ANY"
+                    logger.debug(f"🔄 Setting destination to ANY (everywhere round-trip)")
                 else:
                     val = arg.upper()
                     if len(val) != 3:
                         logger.debug(f"❌ Invalid destination code length: {val}")
-                        await send_tg("⚠️ Код назначения должен быть 3 буквы (IATA)", chat_id, cfg)
+                        await send_tg("⚠️ Код: 3 буквы IATA, 'ANY' для везде, 'off' для отключить", chat_id, cfg)
                         return
                     logger.debug(f"🔄 Setting destination to {val}")
 
@@ -1024,7 +1120,9 @@ async def process_single_update(update: dict, cfg: dict, state: dict) -> None:
             logger.debug(f"💾 Settings saved for user {chat_id}: {key}={val}")
 
             if key == "destination":
-                if val:
+                if val == "ANY":
+                    await send_tg("✅ Режим: везде (туда-обратно, любое направление)", chat_id, cfg)
+                elif val:
                     await send_tg(f"✅ Город назначения: {val} (туда-обратно)", chat_id, cfg)
                 else:
                     await send_tg(f"✅ Туда-обратно отключено (только в одну сторону)", chat_id, cfg)
@@ -1076,7 +1174,7 @@ async def process_single_update(update: dict, cfg: dict, state: dict) -> None:
         save_state(state, cfg)
         s = loaded
         dest = s.get("destination", "")
-        trip_type = f"туда-обратно ({dest})" if dest else "в одну сторону"
+        trip_type = trip_type_label(dest)
         text = (
             f"✅ Пресет `{name}` загружен:\n\n"
             f"✈️ Вылет: `{s['origin']}`\n"

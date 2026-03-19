@@ -1,5 +1,14 @@
 # Changelog
 
+## [1.5] — 2026-03-19
+
+### Added
+- `/destination ANY` — "everywhere" round-trip mode: searches outbound to all destinations,
+  then fetches return flights for the top 20 cheapest destinations found
+- Respects `/tripdays` min/max range and all existing price/duration filters
+- `trip_type_label()` helper to eliminate duplicate trip-type display logic
+- `/settings` and preset display correctly show "везде (туда-обратно)" for ANY mode
+
 ## [1.4] — 2026-03-19
 
 ### Added
