@@ -142,6 +142,17 @@ asyncio background task:
 
 ---
 
+## Backup
+
+`state.json` is backed up daily at 3am by `/opt/backups/pg_backup.sh` via `docker cp`.
+Backups land in `/opt/backups/flightdeals_state_YYYY-MM-DD.json` with 7-day retention.
+
+**To restore:**
+```bash
+docker cp /opt/backups/flightdeals_state_2026-03-19.json comparity-backend-flightdeals-1:/app/data/state.json
+docker restart comparity-backend-flightdeals-1
+```
+
 ## What NOT to do
 
 - Do not add new Python dependencies without a clear reason — the `aiohttp`-only stack is intentional.
