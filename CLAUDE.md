@@ -55,6 +55,41 @@ If you add a new pure function, add tests for it in `tests/test_logic.py`.
 
 ---
 
+## Deploy checklist
+
+Before deploying any version:
+
+```bash
+# 1. Back up current state
+docker cp comparity-backend-flightdeals-1:/app/data/state.json /opt/backups/state_pre_deploy.json
+
+# 2. Run automated tests (no tokens needed)
+cd /opt/flight-deals
+python3 -m venv .venv && .venv/bin/pip install pytest pytest-asyncio aiohttp -q
+.venv/bin/pytest tests/ -q
+# All tests must pass before proceeding
+
+# 3. Switch to target version (skip if staying on current branch)
+git checkout v1.x
+
+# 4. Rebuild and restart
+cd /opt/comparity && docker compose up -d --build backend-flightdeals
+
+# 5. Verify startup
+docker logs comparity-backend-flightdeals-1 --tail=50
+# Look for: webhook registered, hourly check started, no crash
+
+# 6. Smoke test in Telegram
+# Send /start — should respond with command list
+# Send /settings — should respond with current settings
+```
+
+If something is wrong, roll back immediately:
+```bash
+cd /opt/flight-deals && git checkout main  # or any other tag
+cd /opt/comparity && docker compose up -d --build backend-flightdeals
+```
+
 ## Deploying
 
 This service is built and started via the **shared** docker-compose in `/opt/comparity`.
