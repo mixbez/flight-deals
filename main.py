@@ -11,7 +11,7 @@ Features:
   - Admin commands: /approve, /reject, /revoke, /userlist, /users
 """
 
-__version__ = "2.0"
+__version__ = "2.1"
 
 print("[STARTUP] Script loaded, imports starting...")
 
@@ -196,6 +196,7 @@ ADMIN_HELP = """
 /users — список пользователей
 /userlist — все ID пользователей
 /approval on|off — вкл/выкл обязательное одобрение
+/announce текст — отправить объявление всем пользователям (Markdown)
 /analytics — ссылка на дашборд аналитики"""
 
 DEFAULT_USER_SETTINGS = {
@@ -1161,6 +1162,23 @@ async def process_single_update(update: dict, cfg: dict, state: dict) -> None:
 
             await send_tg(f"✅ Отправлено {sent_count}/{len(state['users'])} пользователям!", chat_id, cfg)
             logger.debug(f"✅ /write completed")
+            return
+
+        elif cmd == "/announce":
+            if not arg.strip():
+                await send_tg("⚠️ Укажите сообщение: /announce текст (поддерживает Markdown)", chat_id, cfg)
+                return
+            message = arg.strip()
+            await send_tg(f"📢 Отправляю объявление {len(state['users'])} пользователям...", chat_id, cfg)
+            sent_count = 0
+            for user_id in list(state["users"].keys()):
+                try:
+                    result = await send_tg(message, user_id, cfg)
+                    if result:
+                        sent_count += 1
+                except Exception as e:
+                    logger.error(f"  ❌ Error announcing to {user_id}: {e}")
+            await send_tg(f"✅ Объявление отправлено {sent_count}/{len(state['users'])} пользователям!", chat_id, cfg)
             return
 
         elif cmd == "/analytics":
