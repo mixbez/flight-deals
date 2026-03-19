@@ -1,5 +1,7 @@
-# Secrets — don't commit tokens
+# Secrets and runtime data — never commit
 config.json
+config.json.backup
+state.json
 
 # Python
 __pycache__/
