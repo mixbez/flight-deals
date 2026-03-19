@@ -1,5 +1,10 @@
 # Changelog
 
+## [2.0] — 2026-03-19
+
+### Added
+- Admin command `/analytics` — sends a clickable link to the analytics dashboard
+
 ## [1.9] — 2026-03-19
 
 ### Changed

@@ -11,7 +11,7 @@ Features:
   - Admin commands: /approve, /reject, /revoke, /userlist, /users
 """
 
-__version__ = "1.9"
+__version__ = "2.0"
 
 print("[STARTUP] Script loaded, imports starting...")
 
@@ -195,7 +195,8 @@ ADMIN_HELP = """
 /revoke ID — удалить пользователя (бан)
 /users — список пользователей
 /userlist — все ID пользователей
-/approval on|off — вкл/выкл обязательное одобрение"""
+/approval on|off — вкл/выкл обязательное одобрение
+/analytics — ссылка на дашборд аналитики"""
 
 DEFAULT_USER_SETTINGS = {
     "origin": "BUD",
@@ -1160,6 +1161,12 @@ async def process_single_update(update: dict, cfg: dict, state: dict) -> None:
 
             await send_tg(f"✅ Отправлено {sent_count}/{len(state['users'])} пользователям!", chat_id, cfg)
             logger.debug(f"✅ /write completed")
+            return
+
+        elif cmd == "/analytics":
+            token = analytics_token(cfg)
+            url = f"{cfg.get('webhook_host', '')}/flights/analytics?token={token}"
+            await send_tg(f"📊 [Analytics]({url})", chat_id, cfg)
             return
 
     # User commands (approved users)
