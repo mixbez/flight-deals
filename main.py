@@ -11,7 +11,7 @@ Features:
   - Admin commands: /approve, /reject, /revoke, /userlist, /users
 """
 
-__version__ = "1.7"
+__version__ = "1.8"
 
 print("[STARTUP] Script loaded, imports starting...")
 
@@ -294,6 +294,7 @@ def empty_state() -> dict:
         "revoked": {},
         "last_update_id": 0,
         "approval_required": True,
+        "analytics": {"daily": {}},
     }
 
 
@@ -313,6 +314,36 @@ def save_state(state: dict, cfg: dict) -> None:
     STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
     with open(STATE_PATH, "w", encoding="utf-8") as f:
         json.dump(state, f, indent=2, ensure_ascii=False)
+
+
+def _analytics_day(state: dict) -> dict:
+    """Return today's analytics bucket, creating it if needed."""
+    state.setdefault("analytics", {"daily": {}})
+    today = datetime.utcnow().strftime("%Y-%m-%d")
+    day = state["analytics"]["daily"].setdefault(today, {
+        "joins": 0,
+        "deals_sent": 0,
+        "origins": {},
+        "destinations": {},
+    })
+    return day
+
+
+def record_join(state: dict) -> None:
+    """Increment today's join counter."""
+    _analytics_day(state)["joins"] += 1
+
+
+def record_deals_sent(state: dict, deals: list, settings: dict) -> None:
+    """Record sent deals into today's analytics bucket."""
+    day = _analytics_day(state)
+    day["deals_sent"] += len(deals)
+    origin = settings.get("origin", "")
+    dest = settings.get("destination", "")
+    if origin:
+        day["origins"][origin] = day["origins"].get(origin, 0) + len(deals)
+    dest_label = dest if dest else "one-way"
+    day["destinations"][dest_label] = day["destinations"].get(dest_label, 0) + len(deals)
 
 
 # ---------------------------------------------------------------------------
@@ -844,6 +875,8 @@ async def search_for_user(chat_id: str, state: dict, cfg: dict, notify_if_empty:
 
         await send_tg(text, chat_id, cfg)
 
+        record_deals_sent(state, all_new, settings)
+
         # Update sent deals
         user_data["sent_deals"] = list(sent_hashes | {d[0].get("_hash") for d in all_new})
         state["users"][str(chat_id)] = user_data
@@ -971,7 +1004,9 @@ async def process_single_update(update: dict, cfg: dict, state: dict) -> None:
                 "referral_answer": "",
                 "settings": DEFAULT_USER_SETTINGS.copy(),
                 "sent_deals": [],
+                "joined_at": datetime.utcnow().strftime("%Y-%m-%d"),
             }
+            record_join(state)
             save_state(state, cfg)
             await send_tg("✅ Добро пожаловать! /help для справки.", chat_id, cfg)
         else:
@@ -1006,7 +1041,10 @@ async def process_single_update(update: dict, cfg: dict, state: dict) -> None:
                     "referral_answer": pending.get("referral_answer", ""),
                     "settings": DEFAULT_USER_SETTINGS.copy(),
                     "sent_deals": [],
+                    "joined_at": datetime.utcnow().strftime("%Y-%m-%d"),
                 }
+                record_join(state)
+                save_state(state, cfg)
                 await send_tg(f"✅ Пользователь {pending['name']} одобрен.", chat_id, cfg)
                 await send_tg("✅ Вас одобрили! /help для справки.", target_id, cfg)
             return
@@ -1350,6 +1388,220 @@ async def process_single_update(update: dict, cfg: dict, state: dict) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Analytics
+# ---------------------------------------------------------------------------
+
+def analytics_token(cfg: dict) -> str:
+    """Derive analytics access token from existing secrets — no new config needed."""
+    secret = f"{cfg.get('admin_chat_id', '')}:{cfg.get('telegram_bot_token', '')}"
+    return hashlib.sha256(secret.encode()).hexdigest()[:32]
+
+
+async def handle_analytics_data(request):
+    """JSON endpoint: return aggregated analytics data."""
+    cfg = request.app["cfg"]
+    state = request.app["state"]
+
+    token = request.rel_url.query.get("token", "")
+    if token != analytics_token(cfg):
+        return web.Response(status=403, text="Forbidden")
+
+    daily = state.get("analytics", {}).get("daily", {})
+
+    # Aggregate settings distributions across all users
+    price_dist: dict = {}
+    days_dist: dict = {}
+    origin_totals: dict = {}
+    dest_totals: dict = {}
+
+    for uid, udata in state.get("users", {}).items():
+        s = {**DEFAULT_USER_SETTINGS, **udata.get("settings", {})}
+        p = str(s["base_price_eur"])
+        price_dist[p] = price_dist.get(p, 0) + 1
+        d = str(s["days_ahead"])
+        days_dist[d] = days_dist.get(d, 0) + 1
+
+    # Aggregate origins and destinations from daily stats
+    for day_data in daily.values():
+        for o, cnt in day_data.get("origins", {}).items():
+            origin_totals[o] = origin_totals.get(o, 0) + cnt
+        for d, cnt in day_data.get("destinations", {}).items():
+            dest_totals[d] = dest_totals.get(d, 0) + cnt
+
+    # User join history
+    join_history: dict = {}
+    for uid, udata in state.get("users", {}).items():
+        jd = udata.get("joined_at", "")
+        if jd and jd != "before-analytics":
+            join_history[jd] = join_history.get(jd, 0) + 1
+
+    # Also include daily join counters from analytics bucket
+    for date, day_data in daily.items():
+        joins = day_data.get("joins", 0)
+        if joins:
+            join_history[date] = join_history.get(date, 0) + joins
+
+    data = {
+        "total_users": len(state.get("users", {})),
+        "total_deals_sent": sum(len(u.get("sent_deals", [])) for u in state.get("users", {}).values()),
+        "users_before_analytics": sum(1 for u in state.get("users", {}).values() if u.get("joined_at") == "before-analytics"),
+        "daily": daily,
+        "join_history": dict(sorted(join_history.items())),
+        "settings_price_dist": dict(sorted(price_dist.items(), key=lambda x: int(x[0]))),
+        "settings_days_dist": dict(sorted(days_dist.items(), key=lambda x: int(x[0]))),
+        "all_time_origins": dict(sorted(origin_totals.items(), key=lambda x: -x[1])),
+        "all_time_destinations": dict(sorted(dest_totals.items(), key=lambda x: -x[1])),
+    }
+    return web.json_response(data)
+
+
+ANALYTICS_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Flight Deals Analytics</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #0f1117; color: #e2e8f0; }
+  .header { padding: 24px 32px; border-bottom: 1px solid #1e293b; }
+  .header h1 { font-size: 20px; font-weight: 600; color: #f1f5f9; }
+  .header p { font-size: 13px; color: #64748b; margin-top: 4px; }
+  .kpi-row { display: flex; gap: 16px; padding: 24px 32px; flex-wrap: wrap; }
+  .kpi { background: #1e293b; border-radius: 10px; padding: 20px 24px; flex: 1; min-width: 160px; }
+  .kpi .label { font-size: 12px; color: #64748b; text-transform: uppercase; letter-spacing: .05em; }
+  .kpi .value { font-size: 32px; font-weight: 700; color: #f1f5f9; margin-top: 6px; }
+  .kpi .sub { font-size: 12px; color: #94a3b8; margin-top: 4px; }
+  .charts { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; padding: 0 32px 32px; }
+  .chart-card { background: #1e293b; border-radius: 10px; padding: 20px; }
+  .chart-card h2 { font-size: 13px; font-weight: 600; color: #94a3b8; text-transform: uppercase; letter-spacing: .05em; margin-bottom: 16px; }
+  .chart-card.wide { grid-column: span 2; }
+  canvas { max-height: 220px; }
+  .error { color: #f87171; padding: 32px; text-align: center; }
+  @media (max-width: 768px) { .charts { grid-template-columns: 1fr; } .chart-card.wide { grid-column: span 1; } .kpi-row { flex-direction: column; } }
+</style>
+</head>
+<body>
+<div class="header">
+  <h1>✈️ Flight Deals Analytics</h1>
+  <p id="subtitle">Loading…</p>
+</div>
+<div class="kpi-row" id="kpis"></div>
+<div class="charts" id="charts"></div>
+<script>
+const token = new URLSearchParams(location.search).get('token') || '';
+const BASE = location.origin;
+
+function color(i, a=0.8) {
+  const palette = ['#3b82f6','#10b981','#f59e0b','#ef4444','#8b5cf6','#06b6d4','#f97316','#ec4899'];
+  return palette[i % palette.length].replace(')', `,${a})`).replace('#', 'rgba(').replace(/[0-9a-f]{2}/gi, h => parseInt(h,16)+',').slice(0,-1) + ')';
+}
+function hexToRgba(hex, a) {
+  const r = parseInt(hex.slice(1,3),16), g = parseInt(hex.slice(3,5),16), b = parseInt(hex.slice(5,7),16);
+  return `rgba(${r},${g},${b},${a})`;
+}
+const COLORS = ['#3b82f6','#10b981','#f59e0b','#ef4444','#8b5cf6','#06b6d4','#f97316','#ec4899'];
+
+async function load() {
+  try {
+    const res = await fetch(`${BASE}/flights/analytics/data?token=${token}`);
+    if (!res.ok) { document.getElementById('charts').innerHTML = '<p class="error">Access denied. Check your token.</p>'; return; }
+    const d = await res.json();
+    render(d);
+  } catch(e) {
+    document.getElementById('charts').innerHTML = `<p class="error">Error: ${e.message}</p>`;
+  }
+}
+
+function render(d) {
+  document.getElementById('subtitle').textContent = `Last updated: ${new Date().toLocaleString()}`;
+
+  const todayKey = new Date().toISOString().split('T')[0];
+  const today = d.daily[todayKey] || {};
+
+  document.getElementById('kpis').innerHTML = `
+    <div class="kpi"><div class="label">Total Users</div><div class="value">${d.total_users}</div><div class="sub">${d.users_before_analytics} before analytics</div></div>
+    <div class="kpi"><div class="label">Deals Sent (all time)</div><div class="value">${d.total_deals_sent}</div></div>
+    <div class="kpi"><div class="label">Deals Sent Today</div><div class="value">${today.deals_sent || 0}</div></div>
+    <div class="kpi"><div class="label">New Users Today</div><div class="value">${today.joins || 0}</div></div>
+  `;
+
+  const charts = document.getElementById('charts');
+  charts.innerHTML = '';
+
+  // Deals sent per day (last 30)
+  const days30 = Object.entries(d.daily).slice(-30);
+  if (days30.length) addChart(charts, 'Deals Sent Per Day (last 30)', 'bar', days30.map(x=>x[0]), days30.map(x=>x[1].deals_sent||0), 'wide');
+
+  // Joins per day
+  const joinDays = Object.entries(d.join_history).slice(-30);
+  if (joinDays.length) addChart(charts, 'New Users Per Day (last 30)', 'line', joinDays.map(x=>x[0]), joinDays.map(x=>x[1]), '');
+
+  // Top origins
+  const origins = Object.entries(d.all_time_origins).slice(0,10);
+  if (origins.length) addChart(charts, 'Top Origin Cities (all time)', 'bar', origins.map(x=>x[0]), origins.map(x=>x[1]), '');
+
+  // Top destinations
+  const dests = Object.entries(d.all_time_destinations).slice(0,10);
+  if (dests.length) addChart(charts, 'Top Destinations (all time)', 'bar', dests.map(x=>x[0]), dests.map(x=>x[1]), '');
+
+  // Price distribution
+  const prices = Object.entries(d.settings_price_dist);
+  if (prices.length) addChart(charts, 'Base Price Setting Distribution', 'bar', prices.map(x=>x[0]+'€'), prices.map(x=>x[1]), '');
+
+  // Days ahead distribution
+  const daysD = Object.entries(d.settings_days_dist);
+  if (daysD.length) addChart(charts, 'Days Ahead Setting Distribution', 'bar', daysD.map(x=>x[0]+' days'), daysD.map(x=>x[1]), '');
+}
+
+function addChart(container, title, type, labels, data, extra) {
+  const card = document.createElement('div');
+  card.className = 'chart-card' + (extra === 'wide' ? ' wide' : '');
+  card.innerHTML = `<h2>${title}</h2><canvas></canvas>`;
+  container.appendChild(card);
+  const ctx = card.querySelector('canvas').getContext('2d');
+  const color0 = COLORS[0];
+  new Chart(ctx, {
+    type,
+    data: {
+      labels,
+      datasets: [{
+        data,
+        backgroundColor: type === 'line' ? hexToRgba(color0, 0.15) : labels.map((_,i)=>hexToRgba(COLORS[i%COLORS.length],0.7)),
+        borderColor: type === 'line' ? hexToRgba(color0, 0.9) : labels.map((_,i)=>hexToRgba(COLORS[i%COLORS.length],1)),
+        borderWidth: type === 'line' ? 2 : 1,
+        fill: type === 'line',
+        tension: 0.3,
+      }]
+    },
+    options: {
+      responsive: true,
+      plugins: { legend: { display: false } },
+      scales: {
+        x: { ticks: { color: '#64748b', font: { size: 11 } }, grid: { color: '#1e293b' } },
+        y: { ticks: { color: '#64748b', font: { size: 11 } }, grid: { color: '#334155' }, beginAtZero: true }
+      }
+    }
+  });
+}
+
+load();
+</script>
+</body>
+</html>"""
+
+
+async def handle_analytics_page(request):
+    """Serve the analytics HTML page."""
+    cfg = request.app["cfg"]
+    token = request.rel_url.query.get("token", "")
+    if token != analytics_token(cfg):
+        return web.Response(status=403, text="Forbidden")
+    return web.Response(text=ANALYTICS_HTML, content_type="text/html")
+
+
+# ---------------------------------------------------------------------------
 # Webhook Handler
 # ---------------------------------------------------------------------------
 
@@ -1391,9 +1643,21 @@ async def main():
     state = load_state(cfg)
     logger.info(f"📂 State loaded: {len(state.get('users', {}))} users")
 
+    # Migration: backfill joined_at and analytics for existing users
+    state.setdefault("analytics", {"daily": {}})
+    for uid, udata in state.get("users", {}).items():
+        if "joined_at" not in udata:
+            udata["joined_at"] = "before-analytics"
+
     # Create HTTP session
     session = ClientSession()
     logger.debug("📡 HTTP session created")
+
+    # Log analytics URL
+    token = analytics_token(cfg)
+    analytics_url = f"{cfg.get('webhook_host', '')}/flights/analytics?token={token}"
+    logger.info(f"📊 Analytics: {analytics_url}")
+    print(f"📊 Analytics URL: {analytics_url}", flush=True)
 
     # Set webhook
     logger.debug("🔌 Setting webhook...")
@@ -1404,6 +1668,8 @@ async def main():
     app["state"] = state
     app["cfg"] = cfg
     app.router.add_post(cfg["webhook_path"], handle_webhook)
+    app.router.add_get("/flights/analytics", handle_analytics_page)
+    app.router.add_get("/flights/analytics/data", handle_analytics_data)
 
     # Start web server
     logger.info(f"🌐 Starting web server on port {cfg['listen_port']}")

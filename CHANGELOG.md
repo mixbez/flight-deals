@@ -1,5 +1,19 @@
 # Changelog
 
+## [1.8] — 2026-03-19
+
+### Added
+- Analytics frontend at `/flights/analytics?token=...` (Chart.js dashboard)
+- JSON data endpoint at `/flights/analytics/data?token=...`
+- Token derived from `admin_chat_id` + `telegram_bot_token` — no new config needed
+- Analytics URL logged to stdout on every startup
+- Caddy route: `/flights/analytics*` → `backend-flightdeals:8080`
+- Tracked events: user joins, deals sent per day with origin/destination breakdown
+- Settings distributions: base price and days-ahead across all users
+- `joined_at` field added to user records; existing users backfilled as `"before-analytics"`
+- KPI cards: total users, total deals sent, today's deals, today's new users
+- Charts: deals per day, joins per day, top origins, top destinations, price distribution, days distribution
+
 ## [1.7] — 2026-03-19
 
 ### Added
