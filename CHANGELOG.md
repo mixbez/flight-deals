@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.4] — 2026-03-19
+
+### Added
+- `/tripdays MIN MAX` — set minimum and maximum days between outbound and return flights
+- Default range: 1–30 days
+- Round-trip combination loop now filters out pairs outside the configured range
+- `/settings` shows current trip days range
+
 ## [1.3] — 2026-03-19
 
 ### Added
