@@ -11,7 +11,7 @@ Features:
   - Admin commands: /approve, /reject, /revoke, /userlist, /users
 """
 
-__version__ = "1.6"
+__version__ = "1.7"
 
 print("[STARTUP] Script loaded, imports starting...")
 

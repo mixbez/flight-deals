@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.7] — 2026-03-19
+
+### Added
+- Daily backup of `state.json` via `docker cp` from the running container
+- Integrated into existing `/opt/backups/pg_backup.sh` (runs at 3am via cron)
+- Backup stored as `/opt/backups/flightdeals_state_YYYY-MM-DD.json`, 7-day retention
+- Graceful warning (no crash) if container is not running at backup time
+
 ## [1.6] — 2026-03-19
 
 ### Fixed
