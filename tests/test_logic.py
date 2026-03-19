@@ -11,7 +11,7 @@ import sys
 import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from main import deal_hash, max_price_for_duration, filter_deals, format_deal
+from main import deal_hash, max_price_for_duration, filter_deals, format_deal, estimated_flight_minutes, _haversine_km
 
 
 # ---------------------------------------------------------------------------
@@ -185,13 +185,15 @@ class TestFilterDeals:
     def test_empty_list_returns_empty(self):
         assert filter_deals([], BASE_SETTINGS) == []
 
-    def test_longer_flight_allowed_at_higher_price(self):
-        # 150 min = 2 blocks over 90 → max price 40
-        tickets = [self._make_ticket(price=38, duration=150)]
-        assert len(filter_deals(tickets, BASE_SETTINGS)) == 1
+    def test_longer_actual_duration_does_not_inflate_price_limit(self):
+        # Since v1.6, price limit is based on route distance, not actual duration.
+        # A ticket with no origin/destination falls back to base_duration_minutes (90).
+        # A 150-min actual flight with no known route → max price is still 20€ (base).
+        tickets = [self._make_ticket(price=21, duration=150)]
+        assert filter_deals(tickets, BASE_SETTINGS) == []
 
     def test_longer_flight_rejected_above_threshold(self):
-        tickets = [self._make_ticket(price=41, duration=150)]
+        tickets = [self._make_ticket(price=21, duration=150)]
         assert filter_deals(tickets, BASE_SETTINGS) == []
 
 
@@ -258,3 +260,99 @@ class TestFormatDeal:
         msg = format_deal(minimal, is_round_trip=False)
         assert "BUD" in msg
         assert "LON" in msg
+
+
+# ---------------------------------------------------------------------------
+# estimated_flight_minutes / _haversine_km
+# ---------------------------------------------------------------------------
+
+class TestEstimatedFlightMinutes:
+    def test_known_route_returns_int(self):
+        mins = estimated_flight_minutes("BUD", "LHR")
+        assert isinstance(mins, int)
+        assert mins > 0
+
+    def test_bud_to_lhr_roughly_correct(self):
+        # BUD → LHR is ~1450 km, ~102 min at 850 km/h
+        mins = estimated_flight_minutes("BUD", "LHR")
+        assert 80 <= mins <= 140
+
+    def test_bud_to_sin_long_haul(self):
+        # BUD → SIN is ~10000 km, ~700 min at 850 km/h
+        mins = estimated_flight_minutes("BUD", "SIN")
+        assert 600 <= mins <= 800
+
+    def test_unknown_origin_returns_none(self):
+        assert estimated_flight_minutes("XXX", "LHR") is None
+
+    def test_unknown_destination_returns_none(self):
+        assert estimated_flight_minutes("BUD", "ZZZ") is None
+
+    def test_both_unknown_returns_none(self):
+        assert estimated_flight_minutes("XXX", "ZZZ") is None
+
+    def test_minimum_floor_applied(self):
+        # Very close airports should still return at least 45 min
+        mins = estimated_flight_minutes("BUD", "VIE")
+        assert mins >= 45
+
+    def test_symmetric_distance(self):
+        # Distance A→B should equal B→A (haversine is symmetric)
+        assert estimated_flight_minutes("BUD", "LHR") == estimated_flight_minutes("LHR", "BUD")
+
+
+class TestHaversine:
+    def test_same_point_is_zero(self):
+        assert _haversine_km(0, 0, 0, 0) == 0.0
+
+    def test_bud_to_lhr_approx(self):
+        # Budapest to London Heathrow should be ~1450 km
+        km = _haversine_km(47.43, 19.26, 51.48, -0.45)
+        assert 1350 <= km <= 1550
+
+    def test_symmetry(self):
+        d1 = _haversine_km(47.43, 19.26, 51.48, -0.45)
+        d2 = _haversine_km(51.48, -0.45, 47.43, 19.26)
+        assert abs(d1 - d2) < 0.01
+
+
+class TestFilterDealsDistanceBased:
+    """Tests that filter_deals uses estimated route duration, not actual flight duration."""
+
+    def _make_ticket(self, price, duration, origin="BUD", destination="LHR", transfers=1):
+        return {
+            "price": price,
+            "duration": duration,
+            "transfers": transfers,
+            "origin": origin,
+            "destination": destination,
+        }
+
+    def test_connecting_flight_judged_by_route_not_actual_duration(self):
+        # BUD→LHR estimated ~100 min → max price at base settings = 20€
+        # A connecting flight with 8h actual duration should NOT get a higher price limit
+        # because the route is only ~100 min direct.
+        settings = {**BASE_SETTINGS}  # base_duration=90, base_price=20, increment=10/30min
+        # Price 21 should fail — estimated route ~100 min ≈ 1 block over base → max 30€
+        # But actual duration is 480 min — without the fix, max would be way higher
+        ticket = self._make_ticket(price=25, duration=480)  # 8h connecting, cheap enough for route
+        result = filter_deals([ticket], settings)
+        assert len(result) == 1  # 25 <= 30 (1 block for ~100 min route), so passes
+
+    def test_connecting_flight_too_expensive_for_route(self):
+        # BUD→LHR max price ~30€ (1 block over 90 min base)
+        # Price 50 should fail regardless of actual flight duration
+        ticket = self._make_ticket(price=50, duration=150)
+        assert filter_deals([ticket], BASE_SETTINGS) == []
+
+    def test_unknown_route_falls_back_to_base_duration(self):
+        # Unknown airport pair → falls back to base_duration_minutes=90
+        ticket = {
+            "price": 15,
+            "duration": 60,
+            "transfers": 0,
+            "origin": "XXX",
+            "destination": "ZZZ",
+        }
+        result = filter_deals([ticket], BASE_SETTINGS)
+        assert len(result) == 1  # 15 <= 20 (base price), passes

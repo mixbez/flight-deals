@@ -11,7 +11,7 @@ Features:
   - Admin commands: /approve, /reject, /revoke, /userlist, /users
 """
 
-__version__ = "1.5"
+__version__ = "1.6"
 
 print("[STARTUP] Script loaded, imports starting...")
 
@@ -47,6 +47,116 @@ logging.getLogger().addHandler(file_handler)
 
 logger = logging.getLogger(__name__)
 logger.info("Logging initialized")
+
+# ---------------------------------------------------------------------------
+# Airport coordinates (IATA → (lat, lon)) for distance-based pricing
+# Covers the most common European + global routes. Unknown airports fall back
+# to the user's configured base_duration_minutes.
+# ---------------------------------------------------------------------------
+
+AIRPORT_COORDS: dict[str, tuple[float, float]] = {
+    # Hungary
+    "BUD": (47.43, 19.26),
+    # UK
+    "LHR": (51.48, -0.45), "LGW": (51.15, -0.18), "STN": (51.89, 0.24),
+    "LTN": (51.87, -0.37), "MAN": (53.35, -2.27), "EDI": (55.95, -3.37),
+    "BHX": (52.45, -1.74), "BRS": (51.38, -2.72),
+    # Germany
+    "FRA": (50.03, 8.57), "MUC": (48.35, 11.79), "BER": (52.36, 13.50),
+    "DUS": (51.29, 6.77), "HAM": (53.63, 10.00), "STR": (48.69, 9.22),
+    "CGN": (50.87, 7.14),
+    # France
+    "CDG": (49.01, 2.55), "ORY": (48.72, 2.36), "NCE": (43.66, 7.21),
+    "LYS": (45.72, 5.08), "MRS": (43.44, 5.22),
+    # Spain
+    "MAD": (40.47, -3.56), "BCN": (41.30, 2.08), "AGP": (36.67, -4.50),
+    "PMI": (39.55, 2.74), "VLC": (39.49, -0.48), "SVQ": (37.42, -5.89),
+    "LPA": (27.93, -15.39), "TFS": (28.04, -16.57),
+    # Italy
+    "FCO": (41.80, 12.24), "MXP": (45.63, 8.72), "LIN": (45.45, 9.28),
+    "VCE": (45.51, 12.35), "NAP": (40.88, 14.29), "BLQ": (44.53, 11.29),
+    "CTA": (37.47, 15.07), "PMO": (38.18, 13.09),
+    # Netherlands
+    "AMS": (52.31, 4.77),
+    # Belgium
+    "BRU": (50.90, 4.48),
+    # Austria
+    "VIE": (48.11, 16.57),
+    # Switzerland
+    "ZRH": (47.46, 8.55), "GVA": (46.24, 6.11),
+    # Czech Republic
+    "PRG": (50.10, 14.26),
+    # Poland
+    "WAW": (52.17, 20.97), "KRK": (50.08, 19.78), "WRO": (51.10, 16.89),
+    # Romania
+    "OTP": (44.57, 26.10), "CLJ": (46.79, 23.69),
+    # Greece
+    "ATH": (37.94, 23.95), "SKG": (40.52, 22.97), "HER": (35.34, 25.18),
+    "RHO": (36.41, 28.09), "CFU": (39.60, 19.91),
+    # Turkey
+    "IST": (41.27, 28.75), "SAW": (40.90, 29.31), "AYT": (36.90, 30.80),
+    "ESB": (40.13, 32.99),
+    # Portugal
+    "LIS": (38.77, -9.13), "OPO": (41.24, -8.68), "FAO": (37.01, -7.97),
+    # Croatia
+    "ZAG": (45.74, 16.07), "SPU": (43.54, 16.30), "DBV": (42.56, 18.27),
+    # Serbia
+    "BEG": (44.82, 20.31),
+    # Ukraine / Eastern Europe
+    "KBP": (50.34, 30.89), "LWO": (49.81, 23.95),
+    # Scandinavia
+    "CPH": (55.62, 12.66), "OSL": (60.19, 11.10), "ARN": (59.65, 17.92),
+    "HEL": (60.32, 24.96),
+    # Middle East
+    "DXB": (25.25, 55.36), "AUH": (24.43, 54.65), "DOH": (25.27, 51.61),
+    "TLV": (31.99, 34.79), "AMM": (31.72, 35.99), "BEY": (33.82, 35.49),
+    # Asia
+    "BKK": (13.69, 100.75), "HKT": (8.11, 98.32), "DMK": (13.91, 100.61),
+    "SIN": (1.36, 103.99), "KUL": (2.74, 101.70), "HKG": (22.31, 113.91),
+    "NRT": (35.77, 140.39), "ICN": (37.46, 126.44), "PEK": (40.08, 116.58),
+    "DEL": (28.56, 77.10), "BOM": (19.09, 72.87),
+    # Americas
+    "JFK": (40.64, -73.78), "EWR": (40.69, -74.17), "LAX": (33.94, -118.40),
+    "MIA": (25.79, -80.29), "ORD": (41.97, -87.91), "YYZ": (43.68, -79.63),
+    "GRU": (23.43, -46.47), "EZE": (-34.82, -58.54), "BOG": (4.70, -74.15),
+    "CUN": (21.04, -86.87),
+    # Africa
+    "CAI": (30.11, 31.41), "CMN": (33.37, -7.58), "CPT": (-33.96, 18.60),
+    "JNB": (-26.14, 28.24), "NBO": (-1.32, 36.93), "TUN": (36.85, 10.23),
+    # Australia
+    "SYD": (-33.94, 151.18), "MEL": (-37.67, 144.84),
+}
+
+# Average cruise speed used to estimate flight time from distance
+_AVG_SPEED_KMH = 850.0
+# Minimum estimated duration floor (even very short routes take at least 45 min)
+_MIN_ESTIMATED_MINUTES = 45
+
+
+def _haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Great-circle distance between two points in km."""
+    R = 6371.0
+    phi1, phi2 = math.radians(lat1), math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlam = math.radians(lon2 - lon1)
+    a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlam / 2) ** 2
+    return 2 * R * math.asin(math.sqrt(a))
+
+
+def estimated_flight_minutes(origin: str, destination: str) -> int | None:
+    """Estimate direct flight duration in minutes from airport coordinates.
+
+    Returns None if either airport is not in the known coordinates dict,
+    in which case callers should fall back to user's base_duration_minutes.
+    """
+    if origin not in AIRPORT_COORDS or destination not in AIRPORT_COORDS:
+        return None
+    lat1, lon1 = AIRPORT_COORDS[origin]
+    lat2, lon2 = AIRPORT_COORDS[destination]
+    km = _haversine_km(lat1, lon1, lat2, lon2)
+    minutes = int((km / _AVG_SPEED_KMH) * 60)
+    return max(minutes, _MIN_ESTIMATED_MINUTES)
+
 
 # ---------------------------------------------------------------------------
 # Constants & Config
@@ -264,7 +374,13 @@ def max_price_for_duration(duration_minutes: int, settings: dict) -> int:
 
 
 def filter_deals(tickets: list, settings: dict) -> list:
-    """Filter deals based on user settings."""
+    """Filter deals based on user settings.
+
+    For connecting flights, the price threshold is based on the estimated
+    direct flight duration (from airport distance), not the actual travel time.
+    This prevents a 10h connecting flight from being allowed at a higher price
+    than a 2h direct flight on the same route.
+    """
     result = []
     for ticket in tickets:
         # Extract price and duration
@@ -274,8 +390,16 @@ def filter_deals(tickets: list, settings: dict) -> list:
         if price is None:
             continue
 
-        # Check price vs max price for this duration
-        max_p = max_price_for_duration(duration, settings)
+        # Use estimated direct flight time as the price baseline for connecting flights.
+        # This ensures a BUD→LON flight with 2 stops is judged against the ~2.5h direct
+        # baseline, not its actual 8h travel time.
+        origin = ticket.get("origin", "")
+        destination = ticket.get("destination", "")
+        estimated = estimated_flight_minutes(origin, destination)
+        baseline_duration = estimated if estimated is not None else settings["base_duration_minutes"]
+
+        # Check price vs max price for this route's estimated duration
+        max_p = max_price_for_duration(baseline_duration, settings)
         if price > max_p:
             continue
 

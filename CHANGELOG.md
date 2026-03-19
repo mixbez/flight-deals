@@ -1,5 +1,19 @@
 # Changelog
 
+## [1.6] — 2026-03-19
+
+### Fixed
+- Connecting flight pricing now uses estimated direct flight duration (from airport
+  great-circle distance) as the price baseline, not actual travel time. A 10h connecting
+  flight BUD→LON is now judged against the ~2.5h direct baseline — it can only pass if
+  it's priced like a 2.5h flight, not like a 10h one.
+
+### Added
+- `AIRPORT_COORDS` dictionary with ~100 common airports (IATA → lat/lon)
+- `estimated_flight_minutes(origin, destination)` — haversine + 850 km/h cruise speed
+- Falls back to `base_duration_minutes` for unknown airport pairs
+- `_haversine_km()` pure function (also covered in unit tests)
+
 ## [1.5] — 2026-03-19
 
 ### Added
