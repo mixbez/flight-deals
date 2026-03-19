@@ -1,5 +1,15 @@
 # Changelog
 
+## [1.3] — 2026-03-19
+
+### Added
+- `/savepreset NAME` — save current settings as a named preset (max 5 per user)
+- `/loadpreset NAME` — restore settings from a preset
+- `/deletepreset NAME` — remove a preset
+- `/mypresets` — list all saved presets with a summary
+- Preset names validated: alphanumeric, hyphens and underscores only
+- Presets stored in `state.json` under each user's record
+
 ## [1.2] — 2026-03-19
 
 ### Added
