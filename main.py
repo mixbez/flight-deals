@@ -11,7 +11,7 @@ Features:
   - Admin commands: /approve, /reject, /revoke, /userlist, /users
 """
 
-__version__ = "1.3"
+__version__ = "1.4"
 
 print("[STARTUP] Script loaded, imports starting...")
 
@@ -70,6 +70,7 @@ HELP_TEXT = """🤖 *Команды:*
 /duration N — макс. длительность для базовой цены (мин)
 /increment N — доп. € за каждые 30 мин
 /direct — вкл/выкл только прямые
+/tripdays MIN MAX — мин-макс дней между вылетами (туда-обратно), напр. /tripdays 3 10
 /settings — текущие настройки
 /reset — сбросить историю отправленных
 /savepreset NAME — сохранить текущие настройки как пресет
@@ -99,6 +100,8 @@ DEFAULT_USER_SETTINGS = {
     "market": "hu",
     "limit": 100,
     "direct_only": False,
+    "min_trip_days": 1,   # min days between outbound and return (round-trip only)
+    "max_trip_days": 30,  # max days between outbound and return (round-trip only)
 }
 
 COMMAND_MAP = {
@@ -108,6 +111,7 @@ COMMAND_MAP = {
     "/price": ("base_price_eur", int),
     "/duration": ("base_duration_minutes", int),
     "/increment": ("price_increment_eur", int),
+    "/tripdays": ("trip_days_range", str),  # handled specially: "MIN-MAX" or "MIN MAX"
 }
 
 # Global session for async HTTP calls
@@ -588,8 +592,14 @@ async def search_for_user(chat_id: str, state: dict, cfg: dict, notify_if_empty:
 
             # Combine outbound and return
             limit_per_segment = settings["base_price_eur"]
+            min_trip = settings.get("min_trip_days", 1)
+            max_trip = settings.get("max_trip_days", 30)
             for out_date in outbound_by_date:
                 for ret_date in return_by_date:
+                    # Enforce layover range
+                    trip_length = (ret_date - out_date).days
+                    if trip_length < min_trip or trip_length > max_trip:
+                        continue
                     for out_deal in outbound_by_date[out_date]:
                         for ret_deal in return_by_date[ret_date]:
                             total_price = out_deal.get("price", 0) + ret_deal.get("price", 0)
@@ -925,6 +935,7 @@ async def process_single_update(update: dict, cfg: dict, state: dict) -> None:
             f"⏱️ Макс. длина за базовую цену: {s['base_duration_minutes']}мин `/duration`\n"
             f"📈 Доп. €/30мин: {s['price_increment_eur']}€ `/increment`\n"
             f"🎯 Только прямые: {'✅' if s['direct_only'] else '❌'} `/direct`\n"
+            f"📆 Длительность поездки: {s.get('min_trip_days', 1)}–{s.get('max_trip_days', 30)} дней `/tripdays`\n"
         )
 
         logger.debug(f"📨 Sending settings message to {chat_id}")
@@ -947,6 +958,27 @@ async def process_single_update(update: dict, cfg: dict, state: dict) -> None:
         status = "✅ включены" if settings["direct_only"] else "❌ отключены"
         await send_tg(f"Только прямые рейсы: {status}", chat_id, cfg)
         logger.debug(f"✅ /direct executed for {chat_id}")
+        return
+
+    if cmd == "/tripdays":
+        parts = arg.strip().replace("-", " ").split()
+        if len(parts) != 2:
+            await send_tg("⚠️ Укажите мин и макс: /tripdays MIN MAX (напр. /tripdays 3 10)", chat_id, cfg)
+            return
+        try:
+            min_days, max_days = int(parts[0]), int(parts[1])
+        except ValueError:
+            await send_tg("⚠️ Значения должны быть целыми числами.", chat_id, cfg)
+            return
+        if min_days < 1 or max_days < min_days or max_days > 365:
+            await send_tg("⚠️ Допустимый диапазон: мин ≥ 1, макс ≥ мин, макс ≤ 365.", chat_id, cfg)
+            return
+        settings = user_settings(state, chat_id)
+        settings["min_trip_days"] = min_days
+        settings["max_trip_days"] = max_days
+        state["users"][str(chat_id)]["settings"] = settings
+        save_state(state, cfg)
+        await send_tg(f"✅ Длительность поездки: {min_days}–{max_days} дней.", chat_id, cfg)
         return
 
     # Settings commands
