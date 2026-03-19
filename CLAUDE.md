@@ -142,6 +142,21 @@ asyncio background task:
 
 ---
 
+## Analytics
+
+Available at: `https://{webhook_host}/flights/analytics?token=...`
+
+The token is derived from `admin_chat_id` + `telegram_bot_token` and printed to stdout every time
+the bot starts. Check container logs if you've lost it:
+```bash
+docker logs comparity-backend-flightdeals-1 2>&1 | grep "Analytics URL"
+```
+
+Data is stored in `state.json` under `analytics.daily`. The JSON data endpoint is at
+`/flights/analytics/data?token=...` — same token.
+
+**Caddy route:** `/flights/analytics*` → `backend-flightdeals:8080` (in `/opt/comparity/Caddyfile`)
+
 ## Backup
 
 `state.json` is backed up daily at 3am by `/opt/backups/pg_backup.sh` via `docker cp`.
